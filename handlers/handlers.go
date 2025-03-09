@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/gorilla/mux"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/mstgnz/golog/database"
 	"github.com/mstgnz/golog/models"
 )
@@ -24,16 +26,34 @@ type Client struct {
 }
 
 // SetupRoutes sets up the HTTP routes
-func SetupRoutes() *mux.Router {
-	r := mux.NewRouter()
+func SetupRoutes() http.Handler {
+	r := chi.NewRouter()
+
+	// Add middleware
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	// Setup CORS
+	corsMiddleware := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Content-Type"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300, // Maximum value not ignored by any of major browsers
+	})
+	r.Use(corsMiddleware.Handler)
 
 	// API routes
-	r.HandleFunc("/api/logs", GetLogsHandler).Methods("GET")
-	r.HandleFunc("/api/logs", AddLogHandler).Methods("POST")
-	r.HandleFunc("/api/logs/stream", StreamLogsHandler).Methods("GET")
+	r.Route("/api", func(r chi.Router) {
+		r.Get("/logs", GetLogsHandler)
+		r.Post("/logs", AddLogHandler)
+		r.Get("/logs/stream", StreamLogsHandler)
+	})
 
 	// Serve static files
-	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./web/static")))
+	fileServer := http.FileServer(http.Dir("./web/static"))
+	r.Handle("/*", fileServer)
 
 	return r
 }
@@ -97,7 +117,6 @@ func StreamLogsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	// Create a new client
 	client := &Client{
