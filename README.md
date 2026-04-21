@@ -1,140 +1,177 @@
 # GoLog
 
-Real-time Log Monitoring Tool
+[![CI](https://github.com/mstgnz/golog/actions/workflows/ci.yml/badge.svg)](https://github.com/mstgnz/golog/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/mstgnz/golog)](https://goreportcard.com/report/github.com/mstgnz/golog)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-GoLog is a lightweight log monitoring tool that uses PostgreSQL's LISTEN/NOTIFY feature to provide real-time log monitoring through both web and terminal interfaces.
+Real-time log monitoring tool powered by PostgreSQL LISTEN/NOTIFY.
+
+GoLog provides a lightweight, zero-dependency log pipeline: your application inserts a row into the `logs` table and every connected client (web dashboard or CLI) receives the entry instantly -- no polling, no message queue.
 
 ## Features
 
-- **Real-time Log Monitoring**: View logs as they are added to the database
-- **Web Interface**: Modern web interface with filtering capabilities
-- **Terminal Interface**: CLI tool for terminal-based log monitoring
-- **Log Filtering**: Filter logs by level (INFO, WARNING, ERROR, DEBUG) and type (SYSTEM, AUTH, DATABASE, USER, API)
-- **Docker Support**: Run the entire application stack in Docker
+- **Real-time streaming** via PostgreSQL LISTEN/NOTIFY and Server-Sent Events (SSE)
+- **Web dashboard** with live filtering by level and type
+- **CLI tool** with colored output and `-level` / `-type` flags
+- **REST API** for inserting and querying logs
+- **Input validation** enforcing allowed levels and types
+- **Docker Compose** setup for instant local development
 
-## Getting Started
+## Architecture
 
-### Prerequisites
+```
+Your app
+  |
+  | INSERT INTO logs (level, type, message)
+  v
+PostgreSQL  ──NOTIFY log_channel──>  GoLog server
+                                          |
+                          ┌───────────────┴───────────────┐
+                          v                               v
+                    Web dashboard                    CLI tool
+                  (SSE /api/logs/stream)       (LISTEN goroutine)
+```
 
-- Go 1.22 or higher
-- PostgreSQL 16 or higher
-- Docker and Docker Compose (optional)
+The PostgreSQL trigger `log_notify_trigger` fires on every insert and publishes a JSON payload on `log_channel`. The GoLog server holds a persistent `pq.Listener` and fans the notification out to every connected SSE client.
 
-### Running with Docker
+## Getting started
 
-The easiest way to run GoLog is using Docker Compose:
+### With Docker Compose (recommended)
 
 ```bash
-# Clone the repository
 git clone https://github.com/mstgnz/golog.git
 cd golog
-
-# Start the application
 docker-compose up
 ```
 
-The web interface will be available at http://localhost:8080
+Open http://localhost:8080 in your browser.
 
-### Running Locally
+### Locally
 
-To run the application locally:
-
-1. Set up PostgreSQL and create a database
-2. Create a `.env` file with your database configuration
-3. Run the initialization SQL script
-4. Build and run the application
+**Prerequisites:** Go 1.22+, PostgreSQL 16+
 
 ```bash
-# Clone the repository
 git clone https://github.com/mstgnz/golog.git
 cd golog
 
-# Create .env file (edit as needed)
-cp .env.example .env
+# Configure database connection
+cp .env.example .env   # edit DB_* variables
 
-# Initialize the database
+# Initialize schema and sample data
 psql -U postgres -d golog -f init.sql
 
-# Build and run the web server
-go build -o golog-server cmd/main.go
+# Build
+make build
+
+# Start the web server
 ./golog-server
 
-# In another terminal, run the CLI tool
-go build -o golog-cli cmd/cli/main.go
+# In a second terminal, start the CLI
 ./golog-cli
 ```
 
-## CLI Usage
-
-The CLI tool supports filtering logs by level and type:
+## CLI usage
 
 ```bash
-# Show all logs
-./golog-cli
-
-# Filter by level
-./golog-cli -level=ERROR
-
-# Filter by type
-./golog-cli -type=DATABASE
-
-# Filter by both level and type
-./golog-cli -level=ERROR -type=DATABASE
+./golog-cli                          # stream all logs
+./golog-cli -level=ERROR             # filter by level
+./golog-cli -type=DATABASE           # filter by type
+./golog-cli -level=ERROR -type=AUTH  # combine filters
 ```
 
-## API Endpoints
+Supported levels: `INFO`, `WARNING`, `ERROR`, `DEBUG`
 
-- `GET /api/logs`: Get logs with optional filtering
-- `POST /api/logs`: Add a new log
-- `GET /api/logs/stream`: Stream logs in real-time using Server-Sent Events (SSE)
+Supported types: `SYSTEM`, `AUTH`, `DATABASE`, `USER`, `API`
 
-## Running Tests
+## API reference
 
-GoLog includes a comprehensive test suite. You can run the tests using the provided Makefile:
+### GET /api/logs
+
+Returns the most recent 100 log entries, newest first.
+
+**Query parameters** (all optional):
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `level` | Filter by log level | `level=ERROR` |
+| `type` | Filter by log type | `type=DATABASE` |
+
+**Response**
+
+```json
+[
+  {
+    "id": 42,
+    "timestamp": "2024-01-15T10:30:00Z",
+    "level": "ERROR",
+    "type": "DATABASE",
+    "message": "Connection timeout"
+  }
+]
+```
+
+### POST /api/logs
+
+Insert a new log entry.
+
+**Request body**
+
+```json
+{
+  "level": "INFO",
+  "type": "SYSTEM",
+  "message": "Application started"
+}
+```
+
+**Response**
+
+```json
+{ "id": 43 }
+```
+
+**Validation errors** return `400 Bad Request` with a plain-text description.
+
+### GET /api/logs/stream
+
+Server-Sent Events stream. Each event is a JSON-encoded log entry:
+
+```
+data: {"id":43,"timestamp":"2024-01-15T10:30:01Z","level":"INFO","type":"SYSTEM","message":"Application started"}
+
+```
+
+**Query parameters:** same `level` and `type` filters as `GET /api/logs`.
+
+## Running tests
 
 ```bash
-# Run all tests
-make test
-
-# Run tests with coverage report
-make test-coverage
-
-# Run integration tests (requires a running PostgreSQL instance)
-make test-integration
+make test          # unit + mock tests
+make test-race     # with race detector
+make test-coverage # HTML coverage report
+make lint          # vet + format check
 ```
-
-The test suite includes:
-
-- Unit tests for models
-- Unit tests for configuration
-- Mock-based tests for database operations
-- Mock-based tests for HTTP handlers
-- Integration tests for the main application
 
 ## Development
 
-A Makefile is provided to make development easier:
-
 ```bash
-# Build the application
-make build
-
-# Run the web server
-make run
-
-# Run the CLI tool
-make run-cli
-
-# Clean build artifacts
-make clean
-
-# Build Docker image
-make docker-build
-
-# Run with Docker Compose
-make docker-run
+make build         # build both binaries
+make run           # go run web server
+make run-cli       # go run CLI tool
+make vet           # go vet ./...
+make fmt           # gofmt -w .
+make docker-build  # build Docker image
+make docker-run    # docker-compose up
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on setting up the dev environment, code style, and the pull request workflow.
+
+## Security
+
+For security issues please see [SECURITY.md](SECURITY.md) rather than opening a public issue.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT -- see [LICENSE](LICENSE).

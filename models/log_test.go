@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,6 +50,61 @@ func TestLogJSON(t *testing.T) {
 
 	if unmarshaledLog.Message != log.Message {
 		t.Errorf("Message mismatch: got %s, want %s", unmarshaledLog.Message, log.Message)
+	}
+}
+
+func TestLogValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		log     Log
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "valid log",
+			log:     Log{Level: LevelInfo, Type: TypeSystem, Message: "ok"},
+			wantErr: false,
+		},
+		{
+			name:    "missing message",
+			log:     Log{Level: LevelError, Type: TypeAuth},
+			wantErr: true,
+			errMsg:  "message is required",
+		},
+		{
+			name:    "invalid level",
+			log:     Log{Level: "TRACE", Type: TypeAPI, Message: "test"},
+			wantErr: true,
+			errMsg:  "invalid level",
+		},
+		{
+			name:    "invalid type",
+			log:     Log{Level: LevelDebug, Type: "NETWORK", Message: "test"},
+			wantErr: true,
+			errMsg:  "invalid type",
+		},
+		{
+			name:    "message too long",
+			log:     Log{Level: LevelInfo, Type: TypeUser, Message: strings.Repeat("x", MaxMessageLength+1)},
+			wantErr: true,
+			errMsg:  "exceeds maximum length",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.log.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Validate() expected error, got nil")
+				}
+				if tc.errMsg != "" && !strings.Contains(err.Error(), tc.errMsg) {
+					t.Errorf("Validate() error = %q, want to contain %q", err.Error(), tc.errMsg)
+				}
+			} else if err != nil {
+				t.Fatalf("Validate() unexpected error: %v", err)
+			}
+		})
 	}
 }
 

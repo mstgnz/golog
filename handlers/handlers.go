@@ -5,147 +5,172 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
-	"github.com/mstgnz/golog/database"
 	"github.com/mstgnz/golog/models"
 )
 
-var (
-	clients      = make(map[*Client]bool)
-	clientsMutex sync.Mutex
-	logChan      = make(chan models.Log)
-)
+// LogStore is the interface for log persistence operations.
+type LogStore interface {
+	GetLogs(filter models.LogFilter) ([]models.Log, error)
+	InsertLog(logEntry models.Log) (int, error)
+	ListenForLogs(ctx context.Context, ch chan<- models.Log) error
+}
 
-// Client represents a connected websocket client
+// Client represents a connected SSE client.
 type Client struct {
 	send chan models.Log
 }
 
-// SetupRoutes sets up the HTTP routes
-func SetupRoutes() http.Handler {
-	r := chi.NewRouter()
+// Server holds application state and serves HTTP requests.
+type Server struct {
+	store     LogStore
+	clients   map[*Client]bool
+	clientsMu sync.Mutex
+	logChan   chan models.Log
+}
 
-	// Add middleware
+// NewServer creates a Server backed by the given store.
+func NewServer(store LogStore) *Server {
+	return &Server{
+		store:   store,
+		clients: make(map[*Client]bool),
+		logChan: make(chan models.Log),
+	}
+}
+
+// SetupRoutes registers all HTTP routes and returns the handler.
+func (s *Server) SetupRoutes() http.Handler {
+	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-
-	// Setup CORS
-	corsMiddleware := cors.New(cors.Options{
+	r.Use(cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Content-Type"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
-		MaxAge:           300, // Maximum value not ignored by any of major browsers
-	})
-	r.Use(corsMiddleware.Handler)
+		MaxAge:           300,
+	}).Handler)
 
-	// API routes
 	r.Route("/api", func(r chi.Router) {
-		r.Get("/logs", GetLogsHandler)
-		r.Post("/logs", AddLogHandler)
-		r.Get("/logs/stream", StreamLogsHandler)
+		r.Get("/logs", s.GetLogsHandler)
+		r.Post("/logs", s.AddLogHandler)
+		r.Get("/logs/stream", s.StreamLogsHandler)
 	})
 
-	// Serve static files
 	fileServer := http.FileServer(http.Dir("./web/static"))
 	r.Handle("/*", fileServer)
 
 	return r
 }
 
-// GetLogsHandler handles requests to get logs with optional filtering
-func GetLogsHandler(w http.ResponseWriter, r *http.Request) {
+// GetLogsHandler returns log entries with optional filtering and pagination.
+//
+// Query parameters: level, type, limit (default 100, max 500), offset (default 0).
+func (s *Server) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 	filter := models.LogFilter{
 		Level: r.URL.Query().Get("level"),
 		Type:  r.URL.Query().Get("type"),
 	}
 
-	var logs []models.Log
-	var err error
-
-	// Use the mock function if defined (for testing), otherwise use the real function
-	if GetLogs != nil {
-		logs, err = GetLogs(filter)
-	} else {
-		logs, err = database.GetLogs(filter)
+	if filter.Level != "" && !models.ValidLevels[filter.Level] {
+		http.Error(w, "invalid level", http.StatusBadRequest)
+		return
+	}
+	if filter.Type != "" && !models.ValidTypes[filter.Type] {
+		http.Error(w, "invalid type", http.StatusBadRequest)
+		return
 	}
 
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		filter.Limit = n
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			http.Error(w, "offset must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		filter.Offset = n
+	}
+
+	logs, err := s.store.GetLogs(filter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if logs == nil {
+		logs = []models.Log{}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
+	if err := json.NewEncoder(w).Encode(logs); err != nil {
+		log.Printf("Error encoding logs response: %v", err)
+	}
 }
 
-// AddLogHandler handles requests to add a new log
-func AddLogHandler(w http.ResponseWriter, r *http.Request) {
+// AddLogHandler inserts a new log entry.
+func (s *Server) AddLogHandler(w http.ResponseWriter, r *http.Request) {
 	var logEntry models.Log
 	if err := json.NewDecoder(r.Body).Decode(&logEntry); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	var id int
-	var err error
-
-	// Use the mock function if defined (for testing), otherwise use the real function
-	if InsertLog != nil {
-		id, err = InsertLog(logEntry)
-	} else {
-		id, err = database.InsertLog(logEntry)
+	if err := logEntry.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
+	id, err := s.store.InsertLog(logEntry)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]int{"id": id})
+	if err := json.NewEncoder(w).Encode(map[string]int{"id": id}); err != nil {
+		log.Printf("Error encoding add log response: %v", err)
+	}
 }
 
-// StreamLogsHandler handles SSE connections for real-time log streaming
-func StreamLogsHandler(w http.ResponseWriter, r *http.Request) {
-	// Set headers for SSE
+// StreamLogsHandler streams log entries to the client using Server-Sent Events.
+//
+// Query parameters: level, type (optional filters applied server-side).
+func (s *Server) StreamLogsHandler(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Create a new client
-	client := &Client{
-		send: make(chan models.Log, 256),
-	}
-
-	// Register client
-	clientsMutex.Lock()
-	clients[client] = true
-	clientsMutex.Unlock()
-
-	// Ensure client is removed when connection is closed
-	defer func() {
-		clientsMutex.Lock()
-		delete(clients, client)
-		close(client.send)
-		clientsMutex.Unlock()
-	}()
-
-	// Filter parameters
 	level := r.URL.Query().Get("level")
 	logType := r.URL.Query().Get("type")
 
-	// Stream logs to client
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-		return
-	}
+	client := &Client{send: make(chan models.Log, 256)}
+	s.clientsMu.Lock()
+	s.clients[client] = true
+	s.clientsMu.Unlock()
+
+	defer func() {
+		s.clientsMu.Lock()
+		delete(s.clients, client)
+		close(client.send)
+		s.clientsMu.Unlock()
+	}()
 
 	for {
 		select {
@@ -153,18 +178,13 @@ func StreamLogsHandler(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-
-			// Apply filters
 			if (level == "" || logEntry.Level == level) && (logType == "" || logEntry.Type == logType) {
 				data, err := json.Marshal(logEntry)
 				if err != nil {
 					log.Printf("Error marshaling log entry: %v", err)
 					continue
 				}
-
-				// Write SSE format
-				_, err = w.Write([]byte("data: " + string(data) + "\n\n"))
-				if err != nil {
+				if _, err := w.Write([]byte("data: " + string(data) + "\n\n")); err != nil {
 					return
 				}
 				flusher.Flush()
@@ -175,28 +195,25 @@ func StreamLogsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// StartLogListener starts listening for log notifications
-func StartLogListener(ctx context.Context) error {
-	err := database.ListenForLogs(ctx, logChan)
-	if err != nil {
+// StartLogListener subscribes to the store's notification channel and broadcasts
+// each log entry to all connected SSE clients.
+func (s *Server) StartLogListener(ctx context.Context) error {
+	if err := s.store.ListenForLogs(ctx, s.logChan); err != nil {
 		return err
 	}
-
-	// Broadcast logs to all connected clients
 	go func() {
-		for logEntry := range logChan {
-			clientsMutex.Lock()
-			for client := range clients {
+		for logEntry := range s.logChan {
+			s.clientsMu.Lock()
+			for client := range s.clients {
 				select {
 				case client.send <- logEntry:
 				default:
 					close(client.send)
-					delete(clients, client)
+					delete(s.clients, client)
 				}
 			}
-			clientsMutex.Unlock()
+			s.clientsMu.Unlock()
 		}
 	}()
-
 	return nil
 }

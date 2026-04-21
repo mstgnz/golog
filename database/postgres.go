@@ -12,6 +12,9 @@ import (
 // DB is the database connection
 var DB *sql.DB
 
+// dsn holds the connection string so ListenForLogs can reuse it without re-reading env vars.
+var dsn string
+
 // Connect establishes a connection to the PostgreSQL database
 func Connect() error {
 	host := os.Getenv("DB_HOST")
@@ -22,6 +25,7 @@ func Connect() error {
 
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		host, port, user, password, dbname)
+	dsn = connStr
 
 	var err error
 	DB, err = sql.Open("postgres", connStr)

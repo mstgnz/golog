@@ -8,142 +8,135 @@ import (
 	"github.com/mstgnz/golog/models"
 )
 
-func TestGetLogs(t *testing.T) {
-	// Setup mock DB
-	db, mock, err := SetupMockDB()
+func newTestStore(t *testing.T) (*Store, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock, err := sqlmock.New()
 	if err != nil {
-		t.Fatalf("Failed to set up mock DB: %v", err)
+		t.Fatalf("Failed to create mock DB: %v", err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
+	return &Store{db: db}, mock
+}
 
-	// Test case 1: No filters
+func TestGetLogs(t *testing.T) {
 	t.Run("NoFilters", func(t *testing.T) {
-		// Expected query with no filters
-		mock.ExpectQuery("SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 ORDER BY timestamp DESC LIMIT 100").
+		store, mock := newTestStore(t)
+
+		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 ORDER BY timestamp DESC LIMIT \$1 OFFSET \$2`).
+			WithArgs(100, 0).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
 				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed").
 				AddRow(2, time.Now(), "INFO", "SYSTEM", "System started"))
 
-		// Call the function
-		logs, err := GetLogs(models.LogFilter{})
+		logs, err := store.GetLogs(models.LogFilter{})
 		if err != nil {
-			t.Fatalf("GetLogs() failed: %v", err)
+			t.Fatalf("GetLogs() error: %v", err)
 		}
-
-		// Check results
 		if len(logs) != 2 {
-			t.Errorf("GetLogs() returned %d logs, want 2", len(logs))
+			t.Errorf("GetLogs() = %d logs, want 2", len(logs))
 		}
-
-		// Check for any unfulfilled expectations
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("Unfulfilled expectations: %v", err)
 		}
 	})
 
-	// Test case 2: With level filter
 	t.Run("LevelFilter", func(t *testing.T) {
-		// Reset mock
-		db, mock, err = SetupMockDB()
-		if err != nil {
-			t.Fatalf("Failed to set up mock DB: %v", err)
-		}
-		defer db.Close()
+		store, mock := newTestStore(t)
 
-		// Expected query with level filter
-		mock.ExpectQuery("SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND level = \\$1 ORDER BY timestamp DESC LIMIT 100").
-			WithArgs("ERROR").
+		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND level = \$1 ORDER BY timestamp DESC LIMIT \$2 OFFSET \$3`).
+			WithArgs("ERROR", 100, 0).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
 				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed"))
 
-		// Call the function
-		logs, err := GetLogs(models.LogFilter{Level: "ERROR"})
+		logs, err := store.GetLogs(models.LogFilter{Level: "ERROR"})
 		if err != nil {
-			t.Fatalf("GetLogs() failed: %v", err)
+			t.Fatalf("GetLogs() error: %v", err)
 		}
-
-		// Check results
 		if len(logs) != 1 {
-			t.Errorf("GetLogs() returned %d logs, want 1", len(logs))
+			t.Errorf("GetLogs() = %d logs, want 1", len(logs))
 		}
 		if logs[0].Level != "ERROR" {
 			t.Errorf("Log level = %s, want ERROR", logs[0].Level)
 		}
-
-		// Check for any unfulfilled expectations
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("Unfulfilled expectations: %v", err)
 		}
 	})
 
-	// Test case 3: With type filter
 	t.Run("TypeFilter", func(t *testing.T) {
-		// Reset mock
-		db, mock, err = SetupMockDB()
-		if err != nil {
-			t.Fatalf("Failed to set up mock DB: %v", err)
-		}
-		defer db.Close()
+		store, mock := newTestStore(t)
 
-		// Expected query with type filter
-		mock.ExpectQuery("SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND type = \\$1 ORDER BY timestamp DESC LIMIT 100").
-			WithArgs("DATABASE").
+		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND type = \$1 ORDER BY timestamp DESC LIMIT \$2 OFFSET \$3`).
+			WithArgs("DATABASE", 100, 0).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
 				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed"))
 
-		// Call the function
-		logs, err := GetLogs(models.LogFilter{Type: "DATABASE"})
+		logs, err := store.GetLogs(models.LogFilter{Type: "DATABASE"})
 		if err != nil {
-			t.Fatalf("GetLogs() failed: %v", err)
+			t.Fatalf("GetLogs() error: %v", err)
 		}
-
-		// Check results
 		if len(logs) != 1 {
-			t.Errorf("GetLogs() returned %d logs, want 1", len(logs))
+			t.Errorf("GetLogs() = %d logs, want 1", len(logs))
 		}
 		if logs[0].Type != "DATABASE" {
 			t.Errorf("Log type = %s, want DATABASE", logs[0].Type)
 		}
-
-		// Check for any unfulfilled expectations
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("Unfulfilled expectations: %v", err)
 		}
 	})
 
-	// Test case 4: With both filters
 	t.Run("BothFilters", func(t *testing.T) {
-		// Reset mock
-		db, mock, err = SetupMockDB()
-		if err != nil {
-			t.Fatalf("Failed to set up mock DB: %v", err)
-		}
-		defer db.Close()
+		store, mock := newTestStore(t)
 
-		// Expected query with both filters
-		mock.ExpectQuery("SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND level = \\$1 AND type = \\$2 ORDER BY timestamp DESC LIMIT 100").
-			WithArgs("ERROR", "DATABASE").
+		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND level = \$1 AND type = \$2 ORDER BY timestamp DESC LIMIT \$3 OFFSET \$4`).
+			WithArgs("ERROR", "DATABASE", 100, 0).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
 				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed"))
 
-		// Call the function
-		logs, err := GetLogs(models.LogFilter{Level: "ERROR", Type: "DATABASE"})
+		logs, err := store.GetLogs(models.LogFilter{Level: "ERROR", Type: "DATABASE"})
 		if err != nil {
-			t.Fatalf("GetLogs() failed: %v", err)
+			t.Fatalf("GetLogs() error: %v", err)
 		}
+		if len(logs) != 1 || logs[0].Level != "ERROR" || logs[0].Type != "DATABASE" {
+			t.Errorf("GetLogs() returned unexpected result")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("Unfulfilled expectations: %v", err)
+		}
+	})
 
-		// Check results
+	t.Run("Pagination", func(t *testing.T) {
+		store, mock := newTestStore(t)
+
+		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 ORDER BY timestamp DESC LIMIT \$1 OFFSET \$2`).
+			WithArgs(10, 20).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
+				AddRow(21, time.Now(), "INFO", "SYSTEM", "paged"))
+
+		logs, err := store.GetLogs(models.LogFilter{Limit: 10, Offset: 20})
+		if err != nil {
+			t.Fatalf("GetLogs() error: %v", err)
+		}
 		if len(logs) != 1 {
-			t.Errorf("GetLogs() returned %d logs, want 1", len(logs))
+			t.Errorf("GetLogs() = %d logs, want 1", len(logs))
 		}
-		if logs[0].Level != "ERROR" {
-			t.Errorf("Log level = %s, want ERROR", logs[0].Level)
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("Unfulfilled expectations: %v", err)
 		}
-		if logs[0].Type != "DATABASE" {
-			t.Errorf("Log type = %s, want DATABASE", logs[0].Type)
-		}
+	})
 
-		// Check for any unfulfilled expectations
+	t.Run("LimitCappedAtMax", func(t *testing.T) {
+		store, mock := newTestStore(t)
+
+		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 ORDER BY timestamp DESC LIMIT \$1 OFFSET \$2`).
+			WithArgs(maxLimit, 0).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}))
+
+		_, err := store.GetLogs(models.LogFilter{Limit: 9999})
+		if err != nil {
+			t.Fatalf("GetLogs() error: %v", err)
+		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("Unfulfilled expectations: %v", err)
 		}
@@ -151,37 +144,21 @@ func TestGetLogs(t *testing.T) {
 }
 
 func TestInsertLog(t *testing.T) {
-	// Setup mock DB
-	db, mock, err := SetupMockDB()
-	if err != nil {
-		t.Fatalf("Failed to set up mock DB: %v", err)
-	}
-	defer db.Close()
+	store, mock := newTestStore(t)
 
-	// Test log entry
-	logEntry := models.Log{
-		Level:   "ERROR",
-		Type:    "DATABASE",
-		Message: "Connection failed",
-	}
+	logEntry := models.Log{Level: "ERROR", Type: "DATABASE", Message: "Connection failed"}
 
-	// Expected query
-	mock.ExpectQuery("INSERT INTO logs \\(level, type, message\\) VALUES \\(\\$1, \\$2, \\$3\\) RETURNING id").
+	mock.ExpectQuery(`INSERT INTO logs \(level, type, message\) VALUES \(\$1, \$2, \$3\) RETURNING id`).
 		WithArgs(logEntry.Level, logEntry.Type, logEntry.Message).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 
-	// Call the function
-	id, err := InsertLog(logEntry)
+	id, err := store.InsertLog(logEntry)
 	if err != nil {
-		t.Fatalf("InsertLog() failed: %v", err)
+		t.Fatalf("InsertLog() error: %v", err)
 	}
-
-	// Check results
 	if id != 1 {
-		t.Errorf("InsertLog() returned id = %d, want 1", id)
+		t.Errorf("InsertLog() id = %d, want 1", id)
 	}
-
-	// Check for any unfulfilled expectations
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("Unfulfilled expectations: %v", err)
 	}

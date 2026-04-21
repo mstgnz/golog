@@ -2,20 +2,36 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/lib/pq"
 	"github.com/mstgnz/golog/models"
 )
 
-// GetLogs retrieves logs from the database with optional filtering
-func GetLogs(filter models.LogFilter) ([]models.Log, error) {
+const (
+	defaultLimit = 100
+	maxLimit     = 500
+)
+
+// Store wraps a *sql.DB and provides log operations.
+type Store struct {
+	db  *sql.DB
+	dsn string
+}
+
+// NewStore creates a Store using the connection established by Connect.
+func NewStore() *Store {
+	return &Store{db: DB, dsn: dsn}
+}
+
+// GetLogs retrieves log entries with optional filtering and pagination.
+func (s *Store) GetLogs(filter models.LogFilter) ([]models.Log, error) {
 	query := "SELECT id, timestamp, level, type, message FROM logs WHERE 1=1"
-	args := []interface{}{}
+	args := []any{}
 	argCount := 1
 
 	if filter.Level != "" {
@@ -23,16 +39,24 @@ func GetLogs(filter models.LogFilter) ([]models.Log, error) {
 		args = append(args, filter.Level)
 		argCount++
 	}
-
 	if filter.Type != "" {
 		query += fmt.Sprintf(" AND type = $%d", argCount)
 		args = append(args, filter.Type)
 		argCount++
 	}
 
-	query += " ORDER BY timestamp DESC LIMIT 100"
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
 
-	rows, err := DB.Query(query, args...)
+	query += fmt.Sprintf(" ORDER BY timestamp DESC LIMIT $%d OFFSET $%d", argCount, argCount+1)
+	args = append(args, limit, filter.Offset)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -47,72 +71,55 @@ func GetLogs(filter models.LogFilter) ([]models.Log, error) {
 		logs = append(logs, l)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return logs, nil
+	return logs, rows.Err()
 }
 
-// InsertLog inserts a new log entry into the database
-func InsertLog(logEntry models.Log) (int, error) {
+// InsertLog inserts a new log entry and returns its ID.
+func (s *Store) InsertLog(logEntry models.Log) (int, error) {
 	var id int
-	err := DB.QueryRow(
+	err := s.db.QueryRow(
 		"INSERT INTO logs (level, type, message) VALUES ($1, $2, $3) RETURNING id",
 		logEntry.Level, logEntry.Type, logEntry.Message,
 	).Scan(&id)
-
 	return id, err
 }
 
-// ListenForLogs listens for new log notifications and sends them to the provided channel
-func ListenForLogs(ctx context.Context, logChan chan<- models.Log) error {
-	listener := pq.NewListener(fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		getEnv("DB_HOST", "localhost"),
-		getEnv("DB_PORT", "5432"),
-		getEnv("DB_USER", "postgres"),
-		getEnv("DB_PASSWORD", "postgres"),
-		getEnv("DB_NAME", "golog"),
-	), 10*time.Second, time.Minute, func(ev pq.ListenerEventType, err error) {
+// ListenForLogs subscribes to PostgreSQL NOTIFY on log_channel and forwards
+// each notification as a Log to ch. The goroutine stops and closes ch when ctx
+// is cancelled.
+func (s *Store) ListenForLogs(ctx context.Context, logChan chan<- models.Log) error {
+	listener := pq.NewListener(s.dsn, 10*time.Second, time.Minute, func(ev pq.ListenerEventType, err error) {
 		if err != nil {
 			log.Printf("Error in listener: %v\n", err)
 		}
 	})
 
-	err := listener.Listen("log_channel")
-	if err != nil {
+	if err := listener.Listen("log_channel"); err != nil {
 		return err
 	}
 
 	log.Println("Listening for log notifications on channel: log_channel")
 
 	go func() {
+		defer listener.Close()
+		defer close(logChan)
 		for {
 			select {
 			case n := <-listener.Notify:
+				if n == nil {
+					continue
+				}
 				var logEntry models.Log
-				err := json.Unmarshal([]byte(n.Extra), &logEntry)
-				if err != nil {
+				if err := json.Unmarshal([]byte(n.Extra), &logEntry); err != nil {
 					log.Printf("Error unmarshaling notification: %v\n", err)
 					continue
 				}
 				logChan <- logEntry
 			case <-ctx.Done():
-				listener.Close()
-				close(logChan)
 				return
 			}
 		}
 	}()
 
 	return nil
-}
-
-// Helper function to get environment variables with default values
-func getEnv(key, defaultValue string) string {
-	value, exists := os.LookupEnv(key)
-	if !exists {
-		return defaultValue
-	}
-	return value
 }

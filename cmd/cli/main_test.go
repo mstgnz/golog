@@ -9,12 +9,6 @@ import (
 	"github.com/mstgnz/golog/models"
 )
 
-// Mock printLog function for testing
-func mockPrintLog(logEntry models.Log, buf *bytes.Buffer) {
-	timestamp := logEntry.Timestamp.Format("2006-01-02 15:04:05")
-	buf.WriteString(timestamp + " " + logEntry.Level + " " + logEntry.Type + " " + logEntry.Message + "\n")
-}
-
 func TestPrintLog(t *testing.T) {
 	// Create a test log
 	logEntry := models.Log{
