@@ -28,3 +28,6 @@ go.work.sum
 /golog-server
 /golog-cli
 coverage.html
+
+# Browser automation output
+.playwright-mcp/

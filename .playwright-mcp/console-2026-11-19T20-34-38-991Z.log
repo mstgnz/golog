@@ -1,3 +1,0 @@
-[      62ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:53424/favicon.ico:1
-[   30274ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:53424/api/logs/stream?level=ERROR:1
-[   33278ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:53424/api/logs/stream?level=ERROR:1
