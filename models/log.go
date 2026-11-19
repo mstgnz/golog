@@ -62,3 +62,27 @@ type LogFilter struct {
 	Limit  int    `json:"limit,omitempty"`
 	Offset int    `json:"offset,omitempty"`
 }
+
+// Validate rejects level and type values that no log can have.
+func (f LogFilter) Validate() error {
+	if f.Level != "" && !ValidLevels[f.Level] {
+		return errors.New("invalid level")
+	}
+	if f.Type != "" && !ValidTypes[f.Type] {
+		return errors.New("invalid type")
+	}
+	return nil
+}
+
+// Matches reports whether l passes the level and type filters.
+func (f LogFilter) Matches(l Log) bool {
+	return (f.Level == "" || l.Level == f.Level) && (f.Type == "" || l.Type == f.Type)
+}
+
+// LogEvent is what a listener delivers. Resync means notifications may have
+// been lost (the listener reconnected or a read failed) and consumers should
+// reload the list instead of trusting the stream to be complete.
+type LogEvent struct {
+	Log    Log
+	Resync bool
+}

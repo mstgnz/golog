@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+.env
+.env.*
+!.env.example
+golog-server
+golog-cli
+coverage.out
+coverage.html
+*.test

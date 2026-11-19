@@ -108,44 +108,54 @@ func TestLogValidate(t *testing.T) {
 	}
 }
 
-func TestLogFilter(t *testing.T) {
-	// Test empty filter
-	filter := LogFilter{}
-	if filter.Level != "" || filter.Type != "" {
-		t.Errorf("Empty filter should have empty fields, got Level=%s, Type=%s", filter.Level, filter.Type)
+func TestLogFilterValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		filter  LogFilter
+		wantErr string
+	}{
+		{name: "empty", filter: LogFilter{}},
+		{name: "valid both", filter: LogFilter{Level: LevelError, Type: TypeDatabase}},
+		{name: "invalid level", filter: LogFilter{Level: "TRACE"}, wantErr: "invalid level"},
+		{name: "lowercase level is invalid", filter: LogFilter{Level: "error"}, wantErr: "invalid level"},
+		{name: "invalid type", filter: LogFilter{Type: "NETWORK"}, wantErr: "invalid type"},
 	}
-
-	// Test filter with values
-	filter = LogFilter{
-		Level: "ERROR",
-		Type:  "DATABASE",
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.filter.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.wantErr)
+			}
+		})
 	}
+}
 
-	if filter.Level != "ERROR" {
-		t.Errorf("Level mismatch: got %s, want %s", filter.Level, "ERROR")
+func TestLogFilterMatches(t *testing.T) {
+	entry := Log{Level: LevelError, Type: TypeDatabase}
+	tests := []struct {
+		name   string
+		filter LogFilter
+		want   bool
+	}{
+		{name: "no filter", filter: LogFilter{}, want: true},
+		{name: "level match", filter: LogFilter{Level: LevelError}, want: true},
+		{name: "level mismatch", filter: LogFilter{Level: LevelInfo}, want: false},
+		{name: "type match", filter: LogFilter{Type: TypeDatabase}, want: true},
+		{name: "type mismatch", filter: LogFilter{Type: TypeAuth}, want: false},
+		{name: "both match", filter: LogFilter{Level: LevelError, Type: TypeDatabase}, want: true},
+		{name: "level matches, type does not", filter: LogFilter{Level: LevelError, Type: TypeAuth}, want: false},
 	}
-
-	if filter.Type != "DATABASE" {
-		t.Errorf("Type mismatch: got %s, want %s", filter.Type, "DATABASE")
-	}
-
-	// Test JSON marshaling/unmarshaling
-	jsonData, err := json.Marshal(filter)
-	if err != nil {
-		t.Fatalf("Failed to marshal LogFilter to JSON: %v", err)
-	}
-
-	var unmarshaledFilter LogFilter
-	err = json.Unmarshal(jsonData, &unmarshaledFilter)
-	if err != nil {
-		t.Fatalf("Failed to unmarshal JSON to LogFilter: %v", err)
-	}
-
-	if unmarshaledFilter.Level != filter.Level {
-		t.Errorf("Level mismatch after JSON: got %s, want %s", unmarshaledFilter.Level, filter.Level)
-	}
-
-	if unmarshaledFilter.Type != filter.Type {
-		t.Errorf("Type mismatch after JSON: got %s, want %s", unmarshaledFilter.Type, filter.Type)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.filter.Matches(entry); got != tc.want {
+				t.Fatalf("Matches() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

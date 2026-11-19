@@ -8,8 +8,28 @@ on:
 
 jobs:
   test:
-    name: Test
+    name: Test (Go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: [oldstable, stable]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: golog_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      GOLOG_TEST_DSN: postgres://postgres:postgres@localhost:5432/golog_test?sslmode=disable
 
     steps:
       - uses: actions/checkout@v4
@@ -17,10 +37,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
 
       - name: Verify dependencies
         run: go mod verify
+
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
 
       - name: Build
         run: go build ./...
@@ -28,11 +51,30 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # -p 1: integration tests in different packages share one NOTIFY channel.
       - name: Test
-        run: go test -race -coverprofile=coverage.out ./...
+        run: go test -p 1 -race -count=1 -coverprofile=coverage.out ./...
 
       - name: Upload coverage
+        if: matrix.go == 'stable'
         uses: codecov/codecov-action@v4
         with:
           files: coverage.out
           fail_ci_if_error: false
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: stable
+          go-package: ./...
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t golog:ci .

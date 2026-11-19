@@ -11,6 +11,7 @@
         <header>
             <h1>GoLog</h1>
             <p>Real-time Log Monitoring Tool</p>
+            <span id="status" class="status">connecting...</span>
         </header>
 
         <div class="filters">
@@ -81,8 +82,9 @@
                 </div>
                 <div class="form-group">
                     <label for="log-message">Message:</label>
-                    <textarea id="log-message" required></textarea>
+                    <textarea id="log-message" required maxlength="10000"></textarea>
                 </div>
+                <p id="form-error" class="form-error" hidden></p>
                 <button type="submit">Add Log</button>
             </form>
         </div>

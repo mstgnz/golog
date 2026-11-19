@@ -10,13 +10,21 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      # -h forces TCP: during first-run init Postgres answers only on the
+      # unix socket, so a socket check would report ready too early.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d golog"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   app:
     build: .
     container_name: golog-app
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
     environment:
       DB_HOST: postgres
       DB_PORT: 5432

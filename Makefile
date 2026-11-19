@@ -1,13 +1,16 @@
-.PHONY: build test test-coverage test-race clean run docker-build docker-run vet fmt lint
+.PHONY: build test test-coverage test-race test-integration test-db test-db-stop clean run run-cli docker-build docker-run vet fmt lint help
+
+TEST_DB_PORT ?= 54329
+TEST_DB_DSN  ?= postgres://postgres:postgres@127.0.0.1:$(TEST_DB_PORT)/golog_test?sslmode=disable
 
 # Build targets
 build:
-	go build -o golog-server cmd/main.go
-	go build -o golog-cli cmd/cli/main.go
+	go build -o golog-server ./cmd
+	go build -o golog-cli ./cmd/cli
 
-# Test targets
+# Test targets (unit tests; integration tests skip without GOLOG_TEST_DSN)
 test:
-	go test -v ./...
+	go test ./...
 
 test-race:
 	go test -race ./...
@@ -16,9 +19,18 @@ test-coverage:
 	go test -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out
 
-# Integration test
+# Integration tests against a throwaway Postgres: run `make test-db` first.
+# -p 1: all packages share one NOTIFY channel, so they must not run at once.
 test-integration:
-	INTEGRATION_TEST=true go test -v ./cmd/...
+	GOLOG_TEST_DSN='$(TEST_DB_DSN)' go test -p 1 -race -count=1 ./...
+
+test-db:
+	docker run -d --rm --name golog-test-db -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=golog_test \
+		-p 127.0.0.1:$(TEST_DB_PORT):5432 postgres:16
+	@until docker exec golog-test-db pg_isready -h 127.0.0.1 -U postgres -q; do sleep 1; done
+
+test-db-stop:
+	docker stop golog-test-db
 
 # Code quality
 vet:
@@ -37,17 +49,17 @@ clean:
 
 # Run targets
 run:
-	go run cmd/main.go
+	go run ./cmd
 
 run-cli:
-	go run cmd/cli/main.go
+	go run ./cmd/cli
 
 # Docker targets
 docker-build:
 	docker build -t golog .
 
 docker-run:
-	docker-compose up
+	docker compose up --build
 
 # Help
 help:
@@ -56,7 +68,9 @@ help:
 	@echo "  test             - Run tests"
 	@echo "  test-race        - Run tests with race detector"
 	@echo "  test-coverage    - Run tests with coverage report"
-	@echo "  test-integration - Run integration tests"
+	@echo "  test-db          - Start a throwaway Postgres for integration tests"
+	@echo "  test-integration - Run all tests including integration (needs test-db)"
+	@echo "  test-db-stop     - Stop the throwaway Postgres"
 	@echo "  vet              - Run go vet"
 	@echo "  fmt              - Format source code"
 	@echo "  lint             - Run vet + format check"

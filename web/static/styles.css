@@ -98,6 +98,36 @@ tr:hover {
     background-color: #f5f5f5;
 }
 
+td.message {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+td.empty {
+    text-align: center;
+    color: #888;
+}
+
+.status {
+    display: inline-block;
+    margin-top: 5px;
+    font-size: 13px;
+    color: #888;
+}
+
+.status.live {
+    color: #2ecc71;
+}
+
+.status.reconnecting {
+    color: #e67e22;
+}
+
+.form-error {
+    color: #e74c3c;
+    margin-bottom: 10px;
+}
+
 /* Log level colors */
 .level-INFO {
     color: #2ecc71;

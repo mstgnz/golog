@@ -1,51 +1,53 @@
 package database
 
 import (
+	"context"
 	"database/sql"
-	"fmt"
-	"log"
-	"os"
+	"time"
 
 	_ "github.com/lib/pq"
 )
 
-// DB is the database connection
-var DB *sql.DB
+const (
+	defaultPingInterval      = 90 * time.Second
+	defaultMinReconnectDelay = 10 * time.Second
+	defaultMaxReconnectDelay = time.Minute
+)
 
-// dsn holds the connection string so ListenForLogs can reuse it without re-reading env vars.
-var dsn string
+// Store wraps a *sql.DB and provides log operations.
+type Store struct {
+	db  *sql.DB
+	dsn string // the listener opens its own connection with it
 
-// Connect establishes a connection to the PostgreSQL database
-func Connect() error {
-	host := os.Getenv("DB_HOST")
-	port := os.Getenv("DB_PORT")
-	user := os.Getenv("DB_USER")
-	password := os.Getenv("DB_PASSWORD")
-	dbname := os.Getenv("DB_NAME")
-
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		host, port, user, password, dbname)
-	dsn = connStr
-
-	var err error
-	DB, err = sql.Open("postgres", connStr)
-	if err != nil {
-		return err
-	}
-
-	err = DB.Ping()
-	if err != nil {
-		return err
-	}
-
-	log.Println("Connected to database")
-	return nil
+	pingInterval      time.Duration
+	minReconnectDelay time.Duration
+	maxReconnectDelay time.Duration
 }
 
-// Close closes the database connection
-func Close() {
-	if DB != nil {
-		DB.Close()
-		log.Println("Database connection closed")
+// Open connects to PostgreSQL and verifies the connection.
+func Open(ctx context.Context, dsn string) (*Store, error) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
 	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return newStore(db, dsn), nil
+}
+
+func newStore(db *sql.DB, dsn string) *Store {
+	return &Store{
+		db:                db,
+		dsn:               dsn,
+		pingInterval:      defaultPingInterval,
+		minReconnectDelay: defaultMinReconnectDelay,
+		maxReconnectDelay: defaultMaxReconnectDelay,
+	}
+}
+
+// Close closes the connection pool.
+func (s *Store) Close() error {
+	return s.db.Close()
 }

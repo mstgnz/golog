@@ -3,33 +3,44 @@ package database
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/lib/pq"
-	"github.com/mstgnz/golog/models"
+	"github.com/mstgnz/golog/v2/models"
 )
 
 const (
 	defaultLimit = 100
 	maxLimit     = 500
+
+	notifyChannel = "log_channel"
 )
 
-// Store wraps a *sql.DB and provides log operations.
-type Store struct {
-	db  *sql.DB
-	dsn string
+// ErrNotFound is returned when a log id does not exist.
+var ErrNotFound = errors.New("log not found")
+
+type rowScanner interface {
+	Scan(dest ...any) error
 }
 
-// NewStore creates a Store using the connection established by Connect.
-func NewStore() *Store {
-	return &Store{db: DB, dsn: dsn}
+// scanLog tolerates a NULL timestamp: the column is nullable and rows written
+// straight to the table may carry one.
+func scanLog(row rowScanner) (models.Log, error) {
+	var l models.Log
+	var ts sql.NullTime
+	if err := row.Scan(&l.ID, &ts, &l.Level, &l.Type, &l.Message); err != nil {
+		return models.Log{}, err
+	}
+	l.Timestamp = ts.Time
+	return l, nil
 }
 
-// GetLogs retrieves log entries with optional filtering and pagination.
-func (s *Store) GetLogs(filter models.LogFilter) ([]models.Log, error) {
+// GetLogs retrieves log entries, newest first, with optional filtering and pagination.
+func (s *Store) GetLogs(ctx context.Context, filter models.LogFilter) ([]models.Log, error) {
 	query := "SELECT id, timestamp, level, type, message FROM logs WHERE 1=1"
 	args := []any{}
 	argCount := 1
@@ -53,10 +64,11 @@ func (s *Store) GetLogs(filter models.LogFilter) ([]models.Log, error) {
 		limit = maxLimit
 	}
 
-	query += fmt.Sprintf(" ORDER BY timestamp DESC LIMIT $%d OFFSET $%d", argCount, argCount+1)
+	// id breaks timestamp ties so pages are stable; matches logs_timestamp_id_idx.
+	query += fmt.Sprintf(" ORDER BY timestamp DESC, id DESC LIMIT $%d OFFSET $%d", argCount, argCount+1)
 	args = append(args, limit, filter.Offset)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -64,8 +76,8 @@ func (s *Store) GetLogs(filter models.LogFilter) ([]models.Log, error) {
 
 	var logs []models.Log
 	for rows.Next() {
-		var l models.Log
-		if err := rows.Scan(&l.ID, &l.Timestamp, &l.Level, &l.Type, &l.Message); err != nil {
+		l, err := scanLog(rows)
+		if err != nil {
 			return nil, err
 		}
 		logs = append(logs, l)
@@ -74,52 +86,127 @@ func (s *Store) GetLogs(filter models.LogFilter) ([]models.Log, error) {
 	return logs, rows.Err()
 }
 
+// GetLogByID returns one log entry, or ErrNotFound.
+func (s *Store) GetLogByID(ctx context.Context, id int) (models.Log, error) {
+	row := s.db.QueryRowContext(ctx, "SELECT id, timestamp, level, type, message FROM logs WHERE id = $1", id)
+	l, err := scanLog(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return models.Log{}, ErrNotFound
+	}
+	return l, err
+}
+
 // InsertLog inserts a new log entry and returns its ID.
-func (s *Store) InsertLog(logEntry models.Log) (int, error) {
+func (s *Store) InsertLog(ctx context.Context, logEntry models.Log) (int, error) {
 	var id int
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		"INSERT INTO logs (level, type, message) VALUES ($1, $2, $3) RETURNING id",
 		logEntry.Level, logEntry.Type, logEntry.Message,
 	).Scan(&id)
 	return id, err
 }
 
-// ListenForLogs subscribes to PostgreSQL NOTIFY on log_channel and forwards
-// each notification as a Log to ch. The goroutine stops and closes ch when ctx
-// is cancelled.
-func (s *Store) ListenForLogs(ctx context.Context, logChan chan<- models.Log) error {
-	listener := pq.NewListener(s.dsn, 10*time.Second, time.Minute, func(ev pq.ListenerEventType, err error) {
+// ListenForLogs subscribes to NOTIFY on log_channel, loads each notified row
+// and sends it to ch. After a reconnect, or when a row cannot be read, it
+// sends a Resync event instead. The goroutine closes ch when ctx is cancelled.
+func (s *Store) ListenForLogs(ctx context.Context, ch chan<- models.LogEvent) error {
+	listener := pq.NewListener(s.dsn, s.minReconnectDelay, s.maxReconnectDelay, func(ev pq.ListenerEventType, err error) {
 		if err != nil {
-			log.Printf("Error in listener: %v\n", err)
+			log.Printf("golog: listener: %v", err)
 		}
 	})
-
-	if err := listener.Listen("log_channel"); err != nil {
-		return err
+	// pq's Listen waits for a connection and does not look at ctx.
+	listenErr := make(chan error, 1)
+	go func() { listenErr <- listener.Listen(notifyChannel) }()
+	select {
+	case err := <-listenErr:
+		if err != nil {
+			listener.Close()
+			return err
+		}
+	case <-ctx.Done():
+		listener.Close() // makes the pending Listen return
+		<-listenErr
+		return ctx.Err()
 	}
+	go s.forwardNotifications(ctx, listener, ch)
+	return nil
+}
 
-	log.Println("Listening for log notifications on channel: log_channel")
+func (s *Store) forwardNotifications(ctx context.Context, listener *pq.Listener, ch chan<- models.LogEvent) {
+	defer func() {
+		close(ch)
+		// pq may be blocked handing us a notification (or an in-flight Ping may
+		// be waiting behind one); keep draining until Close lets it finish.
+		go func() {
+			for range listener.Notify {
+			}
+		}()
+		listener.Close()
+	}()
 
-	go func() {
-		defer listener.Close()
-		defer close(logChan)
-		for {
+	// pq does not notice a silently dropped connection on its own; Ping makes
+	// it reconnect. 90s is the interval pq's documentation suggests. Ping runs
+	// off this goroutine: it waits for a reply that pq reads only after it has
+	// delivered pending notifications, which this goroutine must keep draining.
+	ticker := time.NewTicker(s.pingInterval)
+	defer ticker.Stop()
+	pinging := make(chan struct{}, 1)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			select {
-			case n := <-listener.Notify:
-				if n == nil {
-					continue
-				}
-				var logEntry models.Log
-				if err := json.Unmarshal([]byte(n.Extra), &logEntry); err != nil {
-					log.Printf("Error unmarshaling notification: %v\n", err)
-					continue
-				}
-				logChan <- logEntry
+			case pinging <- struct{}{}:
+				go func() {
+					defer func() { <-pinging }()
+					if err := listener.Ping(); err != nil && ctx.Err() == nil {
+						log.Printf("golog: listener ping: %v", err)
+					}
+				}()
+			default: // the previous ping is still in flight
+			}
+		case n, ok := <-listener.Notify:
+			if !ok {
+				return
+			}
+			ev, send := s.eventFor(ctx, n)
+			if !send {
+				continue
+			}
+			select {
+			case ch <- ev:
 			case <-ctx.Done():
 				return
 			}
 		}
-	}()
+	}
+}
 
-	return nil
+// eventFor turns a notification into an event. pq sends a nil notification
+// after reconnecting: anything inserted while disconnected was missed.
+func (s *Store) eventFor(ctx context.Context, n *pq.Notification) (models.LogEvent, bool) {
+	if n == nil {
+		return models.LogEvent{Resync: true}, true
+	}
+	id, err := strconv.Atoi(n.Extra)
+	if err != nil {
+		log.Printf("golog: unexpected notification payload on %s (is the trigger from an older version?)", notifyChannel)
+		return models.LogEvent{}, false
+	}
+	entry, err := s.GetLogByID(ctx, id)
+	switch {
+	case err == nil:
+		return models.LogEvent{Log: entry}, true
+	case errors.Is(err, ErrNotFound):
+		// Deleted or rolled back before we read it; nothing to show.
+		return models.LogEvent{}, false
+	case ctx.Err() != nil:
+		return models.LogEvent{}, false
+	default:
+		log.Printf("golog: read log %d: %v", id, err)
+		return models.LogEvent{Resync: true}, true
+	}
 }

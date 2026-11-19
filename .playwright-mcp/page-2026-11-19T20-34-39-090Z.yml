@@ -1,0 +1,42 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - heading "GoLog" [level=1] [ref=e4]
+    - paragraph [ref=e5]: Real-time Log Monitoring Tool
+    - generic [ref=e6]: live
+  - generic [ref=e7]:
+    - generic [ref=e8]:
+      - generic [ref=e9]: "Level:"
+      - combobox "Level:" [ref=e10]:
+        - option "All Levels" [selected]
+        - option "INFO"
+        - option "WARNING"
+        - option "ERROR"
+        - option "DEBUG"
+    - generic [ref=e11]:
+      - generic [ref=e12]: "Type:"
+      - combobox "Type:" [ref=e13]:
+        - option "All Types" [selected]
+        - option "SYSTEM"
+        - option "AUTH"
+        - option "DATABASE"
+        - option "USER"
+        - option "API"
+    - button "Add Log" [ref=e14] [cursor=pointer]
+  - table [ref=e16]:
+    - rowgroup [ref=e17]:
+      - row [ref=e18]:
+        - columnheader "Timestamp" [ref=e19]
+        - columnheader "Level" [ref=e20]
+        - columnheader "Type" [ref=e21]
+        - columnheader "Message" [ref=e22]
+    - rowgroup [ref=e23]:
+      - row [ref=e24]:
+        - cell "11/19/2026, 11:34:24 PM" [ref=e25]
+        - cell "INFO" [ref=e26]
+        - cell "API" [ref=e27]
+        - cell [ref=e28]
+      - row [ref=e29]:
+        - cell "11/19/2026, 11:34:24 PM" [ref=e30]
+        - cell "ERROR" [ref=e31]
+        - cell "AUTH" [ref=e32]
+        - 'cell "<img src=x onerror=\"document.title=`pwned`\"> attempt" [ref=e33]'
