@@ -251,7 +251,7 @@ func TestLoginLimiterWindowAndPrune(t *testing.T) {
 }
 
 // Backlog: with every tracked address recent, pruning frees nothing; the map
-// must still not grow past its cap. (Each newcomer still triggers a prune scan.)
+// must still not grow past its cap.
 func TestLoginLimiterStaysBounded(t *testing.T) {
 	now := time.Unix(0, 0)
 	l := newLoginLimiter()
@@ -271,6 +271,69 @@ func TestLoginLimiterStaysBounded(t *testing.T) {
 	now = now.Add(loginWindow) // everything goes stale
 	if !l.allow("192.0.2.1") {
 		t.Fatal("a new address should be allowed once stale entries can be pruned")
+	}
+}
+
+// fillLimiter fills l to its cap; at(i) gives entry i's attempt time.
+func fillLimiter(l *loginLimiter, at func(i int) time.Time) {
+	for i := 0; i < loginLimiterMaxIPs; i++ {
+		l.attempts[fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255)] = []time.Time{at(i)}
+	}
+}
+
+// makeAllStale ages every entry so that any scan would free them all. A
+// newcomer still refused afterwards proves no scan ran.
+func makeAllStale(l *loginLimiter, now time.Time) {
+	for k := range l.attempts {
+		l.attempts[k] = []time.Time{now.Add(-2 * loginWindow)}
+	}
+}
+
+// A full limiter must not rescan its whole map for every newcomer: nothing
+// can expire before the oldest tracked attempt does.
+func TestLoginLimiterDoesNotRescanWhileFull(t *testing.T) {
+	start := time.Unix(0, 0)
+	now := start
+	l := newLoginLimiter()
+	l.now = func() time.Time { return now }
+	fillLimiter(l, func(int) time.Time { return start })
+
+	now = start.Add(time.Millisecond)
+	if l.allow("192.0.2.1") { // scans, frees nothing
+		t.Fatal("newcomer allowed while full")
+	}
+	makeAllStale(l, now)
+	now = start.Add(2 * time.Millisecond)
+	if l.allow("192.0.2.2") {
+		t.Fatal("a newcomer triggered a rescan before anything could expire")
+	}
+	now = start.Add(loginWindow) // the original attempts would expire now
+	if !l.allow("192.0.2.3") {
+		t.Fatal("newcomer refused once a scan could free entries")
+	}
+}
+
+// Attempts spread evenly over the window would otherwise allow one scan per
+// expiring entry; scans are spaced at least a tenth of the window apart.
+func TestLoginLimiterSpacesScansUnderSpray(t *testing.T) {
+	start := time.Unix(0, 0)
+	step := loginWindow / loginLimiterMaxIPs
+	l := newLoginLimiter()
+	now := start.Add(loginWindow) // entry 0 has just expired
+	l.now = func() time.Time { return now }
+	fillLimiter(l, func(i int) time.Time { return start.Add(time.Duration(i) * step) })
+
+	if !l.allow("192.0.2.1") { // scan frees entry 0, takes its slot
+		t.Fatal("newcomer refused although an entry had expired")
+	}
+	makeAllStale(l, now)
+	now = now.Add(loginWindow/10 - time.Millisecond)
+	if l.allow("192.0.2.2") {
+		t.Fatal("scanned again before a tenth of the window passed")
+	}
+	now = now.Add(time.Millisecond)
+	if !l.allow("192.0.2.3") {
+		t.Fatal("no scan after a tenth of the window")
 	}
 }
 

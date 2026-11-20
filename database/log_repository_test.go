@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,7 +264,7 @@ func TestInsertLogsBuildsOneStatement(t *testing.T) {
 	mock.ExpectQuery(`SELECT nextval\(pg_get_serial_sequence\('logs', 'id'\)\) FROM generate_series\(1, \$1\)`).
 		WithArgs(2).
 		WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(8).AddRow(7))
-	mock.ExpectExec(`INSERT INTO logs \(id, timestamp, level, type, service, message, attrs\) VALUES \(\$1, COALESCE\(\$2::timestamptz, now\(\)\), \$3, \$4, \$5, \$6, \$7::jsonb\), \(\$8, COALESCE\(\$9::timestamptz, now\(\)\), \$10, \$11, \$12, \$13, \$14::jsonb\)$`).
+	mock.ExpectExec(`INSERT INTO logs \(id, timestamp, level, type, service, message, attrs\) OVERRIDING SYSTEM VALUE VALUES \(\$1, COALESCE\(\$2::timestamptz, now\(\)\), \$3, \$4, \$5, \$6, \$7::jsonb\), \(\$8, COALESCE\(\$9::timestamptz, now\(\)\), \$10, \$11, \$12, \$13, \$14::jsonb\)$`).
 		WithArgs(7, nil, "ERROR", "DATABASE", "", "first", "{}", 8, ts, "INFO", "API", "web", "second", `{"a":1}`).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 
@@ -273,6 +274,21 @@ func TestInsertLogsBuildsOneStatement(t *testing.T) {
 	}
 	if fmt.Sprint(ids) != "[7 8]" {
 		t.Fatalf("ids = %v", ids)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// One row needs no id reservation: a single INSERT ... RETURNING id.
+func TestInsertLogSingleUsesReturning(t *testing.T) {
+	store, mock := newTestStore(t)
+	mock.ExpectQuery(`^INSERT INTO logs \(timestamp, level, type, service, message, attrs\) VALUES \(COALESCE\(\$1::timestamptz, now\(\)\), \$2, \$3, \$4, \$5, \$6::jsonb\) RETURNING id$`).
+		WithArgs(nil, "INFO", "API", "svc", "hello", "{}").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(41))
+	id, err := store.InsertLog(context.Background(), models.Log{Level: "INFO", Type: "API", Service: "svc", Message: "hello"})
+	if err != nil || id != 41 {
+		t.Fatalf("InsertLog() = %d, %v", id, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -301,8 +317,26 @@ func TestInsertLogsFailures(t *testing.T) {
 		store, mock := newTestStore(t)
 		mock.ExpectQuery(reserve).WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(1).AddRow(2))
 		mock.ExpectExec(`INSERT INTO logs`).WillReturnResult(sqlmock.NewResult(0, 1))
-		if _, err := store.InsertLogs(context.Background(), two); err == nil {
-			t.Fatal("want an error when fewer rows were inserted")
+		_, err := store.InsertLogs(context.Background(), two)
+		if err == nil || err.Error() != "inserted 1 rows, expected 2" {
+			t.Fatalf("err = %v, want a plain row-count message", err)
+		}
+	})
+	t.Run("row count unavailable", func(t *testing.T) {
+		store, mock := newTestStore(t)
+		mock.ExpectQuery(reserve).WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(1).AddRow(2))
+		mock.ExpectExec(`INSERT INTO logs`).WillReturnResult(sqlmock.NewErrorResult(errors.New("no count")))
+		_, err := store.InsertLogs(context.Background(), two)
+		if err == nil || !strings.Contains(err.Error(), "count inserted rows: no count") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("insert fails", func(t *testing.T) {
+		store, mock := newTestStore(t)
+		mock.ExpectQuery(reserve).WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(1).AddRow(2))
+		mock.ExpectExec(`INSERT INTO logs`).WillReturnError(errors.New("db down"))
+		if _, err := store.InsertLogs(context.Background(), two); err == nil || !strings.Contains(err.Error(), "db down") {
+			t.Fatalf("err = %v", err)
 		}
 	})
 }
@@ -316,9 +350,8 @@ func TestInsertLogsEmpty(t *testing.T) {
 
 func TestInsertLogError(t *testing.T) {
 	store, mock := newTestStore(t)
-	mock.ExpectQuery(`SELECT nextval`).WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(1))
-	mock.ExpectExec(`INSERT INTO logs`).WillReturnError(errors.New("db down"))
-	if _, err := store.InsertLog(context.Background(), models.Log{Message: "a"}); err == nil {
+	mock.ExpectQuery(`INSERT INTO logs .* RETURNING id$`).WillReturnError(errors.New("db down"))
+	if _, err := store.InsertLog(context.Background(), models.Log{Message: "a"}); err == nil || !strings.Contains(err.Error(), "db down") {
 		t.Fatal("InsertLog() should return the insert error")
 	}
 }

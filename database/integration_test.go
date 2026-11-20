@@ -316,6 +316,71 @@ func TestIntegrationBatchIdsMatchEntries(t *testing.T) {
 	}
 }
 
+// A hand-made table whose id default is a sequence the column does not own:
+// pg_get_serial_sequence returns NULL there. Single inserts must still work,
+// batches must fail with a message that says why.
+func TestIntegrationInsertWithoutOwnedSequence(t *testing.T) {
+	d := newIntegrationDB(t) // no migrate: the table is built by hand
+	if _, err := d.store.db.Exec(`
+		CREATE SEQUENCE custom_log_ids;
+		CREATE TABLE logs (
+			id integer PRIMARY KEY DEFAULT nextval('custom_log_ids'),
+			timestamp timestamptz DEFAULT now(),
+			level varchar(10) NOT NULL,
+			type varchar(50) NOT NULL,
+			service text NOT NULL DEFAULT '',
+			message text NOT NULL,
+			attrs jsonb NOT NULL DEFAULT '{}'
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := d.store.InsertLog(ctx, models.Log{Level: "INFO", Type: "A", Message: "single"}); err != nil {
+		t.Fatalf("single insert = %v, want it to work without an owned sequence", err)
+	}
+	_, err := d.store.InsertLogs(ctx, []models.Log{
+		{Level: "INFO", Type: "A", Message: "one"},
+		{Level: "INFO", Type: "A", Message: "two"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no owned sequence") {
+		t.Fatalf("batch insert = %v, want an explanation about the missing sequence", err)
+	}
+}
+
+// A hand-made table with an identity id: batches insert explicit ids, which
+// GENERATED ALWAYS refuses unless the INSERT says OVERRIDING SYSTEM VALUE.
+func TestIntegrationBatchIntoIdentityColumn(t *testing.T) {
+	d := newIntegrationDB(t) // no migrate: the table is built by hand
+	if _, err := d.store.db.Exec(`
+		CREATE TABLE logs (
+			id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			timestamp timestamptz DEFAULT now(),
+			level varchar(10) NOT NULL,
+			type varchar(50) NOT NULL,
+			service text NOT NULL DEFAULT '',
+			message text NOT NULL,
+			attrs jsonb NOT NULL DEFAULT '{}'
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ids, err := d.store.InsertLogs(ctx, []models.Log{
+		{Level: "INFO", Type: "A", Message: "one"},
+		{Level: "INFO", Type: "A", Message: "two"},
+	})
+	if err != nil {
+		t.Fatalf("batch into an identity column = %v", err)
+	}
+	if got, err := d.store.GetLogByID(ctx, ids[1]); err != nil || got.Message != "two" {
+		t.Fatalf("ids[1] = %d holds %+v, %v", ids[1], got, err)
+	}
+	// The identity sequence stays ahead of the reserved ids.
+	single, err := d.store.InsertLog(ctx, models.Log{Level: "INFO", Type: "A", Message: "after"})
+	if err != nil || single <= ids[1] {
+		t.Fatalf("single insert after the batch = %d, %v", single, err)
+	}
+}
+
 func TestIntegrationClientTimestampKept(t *testing.T) {
 	d := newIntegrationDB(t)
 	d.migrate(t)

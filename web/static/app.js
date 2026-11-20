@@ -82,6 +82,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (eventSource) eventSource.close();
         eventSource = null;
         clearInterval(facetsTimer);
+        clearTimeout(searchTimer); // a pending search would reload after sign-out
         // Signed out: do not leave log data in the page, hidden or not.
         // The sequence bumps make late list and facets responses no-ops.
         loadSeq++;

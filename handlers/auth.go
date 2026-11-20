@@ -201,6 +201,10 @@ type loginLimiter struct {
 	limit    int
 	window   time.Duration
 	now      func() time.Time
+	// nextPrune: before it a full map refuses newcomers without scanning.
+	// It is when the oldest tracked attempt expires, but at least a tenth of
+	// the window after the last scan, so a spray costs ~10 scans per window.
+	nextPrune time.Time
 }
 
 func newLoginLimiter() *loginLimiter {
@@ -212,6 +216,9 @@ func (l *loginLimiter) allow(ip string) bool {
 	defer l.mu.Unlock()
 	now := l.now()
 	if _, known := l.attempts[ip]; !known && len(l.attempts) >= loginLimiterMaxIPs {
+		if now.Before(l.nextPrune) {
+			return false
+		}
 		l.pruneLocked(now)
 		if len(l.attempts) >= loginLimiterMaxIPs {
 			// Refusing a newcomer keeps memory bounded; under an address spray
@@ -239,11 +246,23 @@ func (l *loginLimiter) recentLocked(ip string, now time.Time) []time.Time {
 }
 
 func (l *loginLimiter) pruneLocked(now time.Time) {
+	var oldest time.Time
 	for ip := range l.attempts {
-		if recent := l.recentLocked(ip, now); len(recent) == 0 {
+		recent := l.recentLocked(ip, now)
+		if len(recent) == 0 {
 			delete(l.attempts, ip)
-		} else {
-			l.attempts[ip] = recent
+			continue
+		}
+		l.attempts[ip] = recent
+		if oldest.IsZero() || recent[0].Before(oldest) { // recent is in time order
+			oldest = recent[0]
+		}
+	}
+	l.nextPrune = time.Time{}
+	if !oldest.IsZero() {
+		l.nextPrune = oldest.Add(l.window)
+		if floor := now.Add(l.window / 10); l.nextPrune.Before(floor) {
+			l.nextPrune = floor
 		}
 	}
 }

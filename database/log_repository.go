@@ -164,45 +164,90 @@ func (s *Store) InsertLog(ctx context.Context, logEntry models.Log) (int, error)
 // InsertLogs inserts all entries in one statement (all or nothing) and
 // returns their ids in input order.
 func (s *Store) InsertLogs(ctx context.Context, entries []models.Log) ([]int, error) {
-	if len(entries) == 0 {
+	switch len(entries) {
+	case 0:
 		return nil, nil
+	case 1:
+		// One row has no RETURNING order question: skip the id reservation.
+		query, args, err := insertStatement(entries, nil)
+		if err != nil {
+			return nil, err
+		}
+		var id int
+		if err := s.db.QueryRowContext(ctx, query+" RETURNING id", args...).Scan(&id); err != nil {
+			return nil, err
+		}
+		return []int{id}, nil
 	}
+
 	ids, err := s.reserveIDs(ctx, len(entries))
 	if err != nil {
 		return nil, err
 	}
+	query, args, err := insertStatement(entries, ids)
+	if err != nil {
+		return nil, err
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("count inserted rows: %w", err)
+	}
+	if n != int64(len(entries)) {
+		return nil, fmt.Errorf("inserted %d rows, expected %d", n, len(entries))
+	}
+	return ids, nil
+}
 
-	const cols = 7
+// insertStatement builds one multi-row INSERT. With ids, rows get those
+// explicit ids; without, the column default assigns them.
+func insertStatement(entries []models.Log, ids []int) (string, []any, error) {
 	var b strings.Builder
-	b.WriteString("INSERT INTO logs (id, timestamp, level, type, service, message, attrs) VALUES ")
-	args := make([]any, 0, len(entries)*cols)
+	b.WriteString("INSERT INTO logs (")
+	if ids != nil {
+		b.WriteString("id, ")
+	}
+	b.WriteString("timestamp, level, type, service, message, attrs) ")
+	if ids != nil {
+		// Explicit ids into a GENERATED ALWAYS identity column need this;
+		// for a SERIAL column it is a no-op.
+		b.WriteString("OVERRIDING SYSTEM VALUE ")
+	}
+	b.WriteString("VALUES ")
+	var args []any
+	next := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
 	for i, e := range entries {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		n := i * cols
-		// A client timestamp is kept (batched senders deliver late); none means now().
-		fmt.Fprintf(&b, "($%d, COALESCE($%d::timestamptz, now()), $%d, $%d, $%d, $%d, $%d::jsonb)", n+1, n+2, n+3, n+4, n+5, n+6, n+7)
+		b.WriteString("(")
+		if ids != nil {
+			b.WriteString(next(ids[i]))
+			b.WriteString(", ")
+		}
 		var ts any
 		if !e.Timestamp.IsZero() {
 			ts = e.Timestamp
 		}
 		attrs, err := e.CanonicalAttrs() // never the raw bytes: see CanonicalAttrs
 		if err != nil {
-			return nil, fmt.Errorf("entry %d attrs: %w", i, err)
+			return "", nil, fmt.Errorf("entry %d attrs: %w", i, err)
 		}
-		args = append(args, ids[i], ts, e.Level, e.Type, e.Service, e.Message, string(attrs))
+		// A client timestamp is kept (batched senders deliver late); none means now().
+		fmt.Fprintf(&b, "COALESCE(%s::timestamptz, now()), %s, %s, %s, %s, %s::jsonb)",
+			next(ts), next(e.Level), next(e.Type), next(e.Service), next(e.Message), next(string(attrs)))
 	}
-
-	res, err := s.db.ExecContext(ctx, b.String(), args...)
-	if err != nil {
-		return nil, err
-	}
-	if n, err := res.RowsAffected(); err != nil || n != int64(len(entries)) {
-		return nil, fmt.Errorf("inserted %d rows, expected %d (%v)", n, len(entries), err)
-	}
-	return ids, nil
+	return b.String(), args, nil
 }
+
+// errNoOwnedSequence explains a NULL from pg_get_serial_sequence.
+var errNoOwnedSequence = errors.New("logs.id has no owned sequence, so batch ids cannot be reserved; batches need the schema golog creates (GOLOG_AUTO_MIGRATE)")
 
 // reserveIDs takes n ids from the logs id sequence, ascending. Inserting
 // with them makes ids[i] belong to entries[i] by construction; the order of
@@ -217,11 +262,14 @@ func (s *Store) reserveIDs(ctx context.Context, n int) ([]int, error) {
 	defer rows.Close()
 	ids := make([]int, 0, n)
 	for rows.Next() {
-		var id int
+		var id sql.NullInt64
 		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		if !id.Valid {
+			return nil, errNoOwnedSequence
+		}
+		ids = append(ids, int(id.Int64))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

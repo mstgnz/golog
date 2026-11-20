@@ -4,6 +4,16 @@ All notable changes to GoLog are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.2] - 2026-11-20
+
+### Fixed
+- Login rate limiter: while it is full, a new address is refused without rescanning every tracked address. The next scan waits until the oldest entry can expire, and at least a tenth of the window, so an address spray costs about ten scans a minute.
+- Single-entry inserts (`POST /api/logs`, and batches of one) use one `INSERT ... RETURNING id` again instead of reserving an id first.
+- Dashboard: a search typed just before signing out no longer reloads the list after sign-out.
+- A batch insert whose row count does not match reports it in a plain message.
+- On a hand-made `logs` table whose `id` default is not owned by the column, batch inserts now fail with an explanation instead of a scan error; single inserts keep working.
+- Batch inserts also work when `logs.id` is a `GENERATED ALWAYS AS IDENTITY` column (`OVERRIDING SYSTEM VALUE`).
+
 ## [2.1.1] - 2026-11-20
 
 ### Fixed
