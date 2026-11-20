@@ -18,9 +18,10 @@ const (
 	sessionMaxAge  = 7 * 24 * time.Hour
 	sessionContext = "golog-session-v1" // HMAC domain separator for the cookie value
 
-	loginAttempts = 5 // per IP per loginWindow
+	loginAttempts = 5 // per IP (IPv6: per /64) per loginWindow
 	loginWindow   = time.Minute
-	// loginLimiterMaxIPs bounds the limiter's memory under a spray of addresses.
+	// loginLimiterMaxIPs caps how many addresses the limiter tracks. When it
+	// is full of recent ones, new addresses are refused until entries expire.
 	loginLimiterMaxIPs = 10000
 )
 
@@ -127,7 +128,7 @@ func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "authentication is not enabled", http.StatusBadRequest)
 		return
 	}
-	if !s.logins.allow(clientIP(r)) {
+	if !s.logins.allow(limiterKey(clientIP(r))) {
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "too many login attempts", http.StatusTooManyRequests)
 		return
@@ -180,6 +181,19 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// limiterKey groups IPv6 addresses by /64: one subscriber usually holds a
+// whole /64, so per-address counting would give them billions of budgets.
+func limiterKey(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return v4.String()
+	}
+	return parsed.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
 // loginLimiter allows `limit` attempts per IP per window (sliding).
 type loginLimiter struct {
 	mu       sync.Mutex
@@ -197,8 +211,13 @@ func (l *loginLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	if len(l.attempts) >= loginLimiterMaxIPs {
+	if _, known := l.attempts[ip]; !known && len(l.attempts) >= loginLimiterMaxIPs {
 		l.pruneLocked(now)
+		if len(l.attempts) >= loginLimiterMaxIPs {
+			// Refusing a newcomer keeps memory bounded; under an address spray
+			// sign-in pauses for new addresses, Bearer tokens are unaffected.
+			return false
+		}
 	}
 	recent := l.recentLocked(ip, now)
 	if len(recent) >= l.limit {

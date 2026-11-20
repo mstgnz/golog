@@ -167,9 +167,14 @@ func (s *Store) InsertLogs(ctx context.Context, entries []models.Log) ([]int, er
 	if len(entries) == 0 {
 		return nil, nil
 	}
-	const cols = 6
+	ids, err := s.reserveIDs(ctx, len(entries))
+	if err != nil {
+		return nil, err
+	}
+
+	const cols = 7
 	var b strings.Builder
-	b.WriteString("INSERT INTO logs (timestamp, level, type, service, message, attrs) VALUES ")
+	b.WriteString("INSERT INTO logs (id, timestamp, level, type, service, message, attrs) VALUES ")
 	args := make([]any, 0, len(entries)*cols)
 	for i, e := range entries {
 		if i > 0 {
@@ -177,7 +182,7 @@ func (s *Store) InsertLogs(ctx context.Context, entries []models.Log) ([]int, er
 		}
 		n := i * cols
 		// A client timestamp is kept (batched senders deliver late); none means now().
-		fmt.Fprintf(&b, "(COALESCE($%d::timestamptz, now()), $%d, $%d, $%d, $%d, $%d::jsonb)", n+1, n+2, n+3, n+4, n+5, n+6)
+		fmt.Fprintf(&b, "($%d, COALESCE($%d::timestamptz, now()), $%d, $%d, $%d, $%d, $%d::jsonb)", n+1, n+2, n+3, n+4, n+5, n+6, n+7)
 		var ts any
 		if !e.Timestamp.IsZero() {
 			ts = e.Timestamp
@@ -186,17 +191,31 @@ func (s *Store) InsertLogs(ctx context.Context, entries []models.Log) ([]int, er
 		if err != nil {
 			return nil, fmt.Errorf("entry %d attrs: %w", i, err)
 		}
-		args = append(args, ts, e.Level, e.Type, e.Service, e.Message, string(attrs))
+		args = append(args, ids[i], ts, e.Level, e.Type, e.Service, e.Message, string(attrs))
 	}
-	// RETURNING follows VALUES order for a plain multi-row INSERT.
-	b.WriteString(" RETURNING id")
 
-	rows, err := s.db.QueryContext(ctx, b.String(), args...)
+	res, err := s.db.ExecContext(ctx, b.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != int64(len(entries)) {
+		return nil, fmt.Errorf("inserted %d rows, expected %d (%v)", n, len(entries), err)
+	}
+	return ids, nil
+}
+
+// reserveIDs takes n ids from the logs id sequence, ascending. Inserting
+// with them makes ids[i] belong to entries[i] by construction; the order of
+// RETURNING rows is not documented. Unused ids after a failure are gaps,
+// as with any sequence.
+func (s *Store) reserveIDs(ctx context.Context, n int) ([]int, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT nextval(pg_get_serial_sequence('logs', 'id')) FROM generate_series(1, $1)", n)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	ids := make([]int, 0, len(entries))
+	ids := make([]int, 0, n)
 	for rows.Next() {
 		var id int
 		if err := rows.Scan(&id); err != nil {
@@ -207,9 +226,10 @@ func (s *Store) InsertLogs(ctx context.Context, entries []models.Log) ([]int, er
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if len(ids) != len(entries) {
-		return nil, fmt.Errorf("inserted %d rows, expected %d", len(ids), len(entries))
+	if len(ids) != n {
+		return nil, fmt.Errorf("reserved %d ids, expected %d", len(ids), n)
 	}
+	sort.Ints(ids) // ascending, so ids follow input order like plain inserts do
 	return ids, nil
 }
 

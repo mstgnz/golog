@@ -4,6 +4,13 @@ All notable changes to GoLog are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.1] - 2026-11-20
+
+### Fixed
+- Dashboard: signing out now also clears the type and service suggestions and the selected filters, and a facets response that arrives after sign-out is ignored. Before, type and service names could stay in the page.
+- Login rate limiter: memory is now actually bounded. When it tracks the maximum number of recent addresses, new addresses are refused until entries expire (Bearer tokens are unaffected). IPv6 addresses share one budget per /64.
+- `POST /api/logs/batch` reserves ids from the sequence before inserting, so each returned id belongs to the entry at the same position by construction, not by the undocumented order of `RETURNING`.
+
 ## [2.1.0] - 2026-11-20
 
 Nothing changes for existing HTTP clients, SQL writers or databases unless noted below; the server migrates the schema on start.

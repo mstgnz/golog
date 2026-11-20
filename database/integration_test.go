@@ -280,6 +280,42 @@ func TestIntegrationBatchInsertNotifiesEachRow(t *testing.T) {
 	}
 }
 
+// ids[i] must be the row of entries[i]; the API returns ids in input order.
+func TestIntegrationBatchIdsMatchEntries(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	ctx := context.Background()
+	entries := make([]models.Log, 100)
+	for i := range entries {
+		entries[i] = models.Log{Level: "INFO", Type: "A", Message: fmt.Sprintf("entry %d", i)}
+	}
+	ids, err := d.store.InsertLogs(ctx, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		got, err := d.store.GetLogByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Message != entries[i].Message {
+			t.Fatalf("ids[%d] = %d holds %q, want %q", i, id, got.Message, entries[i].Message)
+		}
+		if i > 0 && id <= ids[i-1] {
+			t.Fatalf("ids not increasing in input order: %v", ids[:i+1])
+		}
+	}
+
+	// A plain INSERT afterwards still gets a fresh id from the same sequence.
+	var next int
+	if err := d.store.db.QueryRow("INSERT INTO logs (level, type, message) VALUES ('INFO','A','plain') RETURNING id").Scan(&next); err != nil {
+		t.Fatal(err)
+	}
+	if next <= ids[len(ids)-1] {
+		t.Fatalf("plain insert got id %d, not after the batch's %d", next, ids[len(ids)-1])
+	}
+}
+
 func TestIntegrationClientTimestampKept(t *testing.T) {
 	d := newIntegrationDB(t)
 	d.migrate(t)

@@ -27,6 +27,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let eventSource = null;
     let loadSeq = 0;
+    let facetsSeq = 0;
     // While a list load is in flight, live entries wait here so that
     // rendering the list does not wipe them out.
     let pending = null;
@@ -82,12 +83,18 @@ document.addEventListener('DOMContentLoaded', () => {
         eventSource = null;
         clearInterval(facetsTimer);
         // Signed out: do not leave log data in the page, hidden or not.
+        // The sequence bumps make late list and facets responses no-ops.
         loadSeq++;
+        facetsSeq++;
         pending = null;
         shown.clear();
         logTable.replaceChildren();
+        typeFilter.value = '';
+        serviceFilter.value = '';
         fillSelect(typeFilter, [], 'All Types');
         fillSelect(serviceFilter, [], 'All Services');
+        fillDatalist('type-options', []);
+        fillDatalist('service-options', []);
         appEl.hidden = true;
         logoutBtn.hidden = true;
         loginEl.hidden = false;
@@ -178,6 +185,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function loadFacets() {
+        const seq = ++facetsSeq;
         fetch('/api/facets')
             .then((response) => {
                 if (response.status === 401) throw new Error('unauthorized');
@@ -185,12 +193,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 return response.json();
             })
             .then((facets) => {
+                if (seq !== facetsSeq) return; // signed out or a newer load meanwhile
                 fillSelect(typeFilter, facets.types, 'All Types');
                 fillSelect(serviceFilter, facets.services, 'All Services');
                 fillDatalist('type-options', facets.types);
                 fillDatalist('service-options', facets.services);
             })
             .catch((error) => {
+                if (seq !== facetsSeq) return;
                 if (error.message === 'unauthorized') showLogin();
                 else console.error('Error loading facets:', error);
             });

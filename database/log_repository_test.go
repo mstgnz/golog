@@ -259,9 +259,13 @@ func TestInsertLogsBuildsOneStatement(t *testing.T) {
 		{Level: "ERROR", Type: "DATABASE", Message: "first"},
 		{Timestamp: ts, Level: "INFO", Type: "API", Service: "web", Message: "second", Attrs: json.RawMessage(`{"a":1}`)},
 	}
-	mock.ExpectQuery(`INSERT INTO logs \(timestamp, level, type, service, message, attrs\) VALUES \(COALESCE\(\$1::timestamptz, now\(\)\), \$2, \$3, \$4, \$5, \$6::jsonb\), \(COALESCE\(\$7::timestamptz, now\(\)\), \$8, \$9, \$10, \$11, \$12::jsonb\) RETURNING id`).
-		WithArgs(nil, "ERROR", "DATABASE", "", "first", "{}", ts, "INFO", "API", "web", "second", `{"a":1}`).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(7).AddRow(8))
+	// The sequence may hand ids out of order; they are sorted before use.
+	mock.ExpectQuery(`SELECT nextval\(pg_get_serial_sequence\('logs', 'id'\)\) FROM generate_series\(1, \$1\)`).
+		WithArgs(2).
+		WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(8).AddRow(7))
+	mock.ExpectExec(`INSERT INTO logs \(id, timestamp, level, type, service, message, attrs\) VALUES \(\$1, COALESCE\(\$2::timestamptz, now\(\)\), \$3, \$4, \$5, \$6, \$7::jsonb\), \(\$8, COALESCE\(\$9::timestamptz, now\(\)\), \$10, \$11, \$12, \$13, \$14::jsonb\)$`).
+		WithArgs(7, nil, "ERROR", "DATABASE", "", "first", "{}", 8, ts, "INFO", "API", "web", "second", `{"a":1}`).
+		WillReturnResult(sqlmock.NewResult(0, 2))
 
 	ids, err := store.InsertLogs(context.Background(), entries)
 	if err != nil {
@@ -270,14 +274,37 @@ func TestInsertLogsBuildsOneStatement(t *testing.T) {
 	if fmt.Sprint(ids) != "[7 8]" {
 		t.Fatalf("ids = %v", ids)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func TestInsertLogsRowCountMismatch(t *testing.T) {
-	store, mock := newTestStore(t)
-	mock.ExpectQuery(`INSERT INTO logs`).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(7))
-	if _, err := store.InsertLogs(context.Background(), []models.Log{{Message: "a"}, {Message: "b"}}); err == nil {
-		t.Fatal("InsertLogs() should fail when fewer ids come back than rows were sent")
-	}
+func TestInsertLogsFailures(t *testing.T) {
+	two := []models.Log{{Message: "a"}, {Message: "b"}}
+	reserve := `SELECT nextval`
+
+	t.Run("reserve fails", func(t *testing.T) {
+		store, mock := newTestStore(t)
+		mock.ExpectQuery(reserve).WillReturnError(errors.New("db down"))
+		if _, err := store.InsertLogs(context.Background(), two); err == nil {
+			t.Fatal("want the reserve error")
+		}
+	})
+	t.Run("too few ids reserved", func(t *testing.T) {
+		store, mock := newTestStore(t)
+		mock.ExpectQuery(reserve).WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(1))
+		if _, err := store.InsertLogs(context.Background(), two); err == nil {
+			t.Fatal("want an error for a short reservation")
+		}
+	})
+	t.Run("insert affects fewer rows", func(t *testing.T) {
+		store, mock := newTestStore(t)
+		mock.ExpectQuery(reserve).WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(1).AddRow(2))
+		mock.ExpectExec(`INSERT INTO logs`).WillReturnResult(sqlmock.NewResult(0, 1))
+		if _, err := store.InsertLogs(context.Background(), two); err == nil {
+			t.Fatal("want an error when fewer rows were inserted")
+		}
+	})
 }
 
 func TestInsertLogsEmpty(t *testing.T) {
@@ -289,7 +316,8 @@ func TestInsertLogsEmpty(t *testing.T) {
 
 func TestInsertLogError(t *testing.T) {
 	store, mock := newTestStore(t)
-	mock.ExpectQuery(`INSERT INTO logs`).WillReturnError(errors.New("db down"))
+	mock.ExpectQuery(`SELECT nextval`).WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(1))
+	mock.ExpectExec(`INSERT INTO logs`).WillReturnError(errors.New("db down"))
 	if _, err := store.InsertLog(context.Background(), models.Log{Message: "a"}); err == nil {
 		t.Fatal("InsertLog() should return the insert error")
 	}

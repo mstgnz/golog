@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -246,6 +247,60 @@ func TestLoginLimiterWindowAndPrune(t *testing.T) {
 	l.allow("b")
 	if len(l.attempts) > 2 {
 		t.Fatalf("limiter kept %d stale addresses after prune", len(l.attempts))
+	}
+}
+
+// Backlog: with every tracked address recent, pruning frees nothing; the map
+// must still not grow past its cap. (Each newcomer still triggers a prune scan.)
+func TestLoginLimiterStaysBounded(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := newLoginLimiter()
+	l.now = func() time.Time { return now }
+	for i := 0; i < loginLimiterMaxIPs; i++ {
+		l.attempts[fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255)] = []time.Time{now}
+	}
+	if l.allow("192.0.2.1") {
+		t.Fatal("a new address was allowed while the limiter is full of recent ones")
+	}
+	if len(l.attempts) > loginLimiterMaxIPs {
+		t.Fatalf("limiter holds %d addresses, cap is %d", len(l.attempts), loginLimiterMaxIPs)
+	}
+	if !l.allow("10.0.0.0") {
+		t.Fatal("an address already tracked must keep its own budget")
+	}
+	now = now.Add(loginWindow) // everything goes stale
+	if !l.allow("192.0.2.1") {
+		t.Fatal("a new address should be allowed once stale entries can be pruned")
+	}
+}
+
+func TestLimiterKey(t *testing.T) {
+	tests := map[string]string{
+		"203.0.113.7":          "203.0.113.7",
+		"2001:db8:1:2:3:4:5:6": "2001:db8:1:2::/64",
+		"2001:db8:1:2:ffff::1": "2001:db8:1:2::/64",
+		"::ffff:203.0.113.7":   "203.0.113.7",
+		"not an ip":            "not an ip",
+	}
+	for in, want := range tests {
+		if got := limiterKey(in); got != want {
+			t.Errorf("limiterKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestLoginRateLimitSharesIPv6Slash64(t *testing.T) {
+	h := authServer().SetupRoutes()
+	for i := 0; i < loginAttempts; i++ {
+		addr := fmt.Sprintf("[2001:db8:1:2::%x]:1234", i+1) // a new address each time, same /64
+		rr := do(t, h, "POST", "/api/session", `{"token":"guess-0123456789abc"}`, func(r *http.Request) { r.RemoteAddr = addr })
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d", i, rr.Code)
+		}
+	}
+	rr := do(t, h, "POST", "/api/session", `{"token":"`+testReadToken+`"}`, func(r *http.Request) { r.RemoteAddr = "[2001:db8:1:2::ffff]:1234" })
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("another address in the same /64 = %d, want 429", rr.Code)
 	}
 }
 
