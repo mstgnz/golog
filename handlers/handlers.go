@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,8 +19,12 @@ import (
 )
 
 const (
-	// maxBodyBytes fits MaxMessageLength of 4-byte runes plus JSON overhead.
-	maxBodyBytes = 64 << 10
+	// maxBodyBytes fits one maximum entry: 10000 characters escaped as \uXXXX
+	// (6 bytes each) plus 16 KiB of attrs and JSON overhead.
+	maxBodyBytes = 128 << 10
+	// maxBatchBodyBytes and maxBatchEntries bound POST /api/logs/batch.
+	maxBatchBodyBytes = 2 << 20
+	maxBatchEntries   = 100
 	// clientBuffer is how many events a stream client may lag before it is dropped.
 	clientBuffer = 256
 	// defaultHeartbeat keeps idle streams alive through proxies that cut
@@ -33,6 +39,9 @@ const (
 type LogStore interface {
 	GetLogs(ctx context.Context, filter models.LogFilter) ([]models.Log, error)
 	InsertLog(ctx context.Context, logEntry models.Log) (int, error)
+	// InsertLogs inserts all entries or none and returns ids in input order.
+	InsertLogs(ctx context.Context, entries []models.Log) ([]int, error)
+	Facets(ctx context.Context) (models.Facets, error)
 	// ListenForLogs must close ch when ctx is cancelled.
 	ListenForLogs(ctx context.Context, ch chan<- models.LogEvent) error
 }
@@ -44,6 +53,7 @@ type Options struct {
 	CORSAllowedOrigins []string
 	// Static is served at / when set.
 	Static fs.FS
+	Auth   Auth
 }
 
 // Server holds application state and serves HTTP requests.
@@ -51,6 +61,7 @@ type Server struct {
 	store        LogStore
 	opts         Options
 	hub          *hub
+	logins       *loginLimiter
 	heartbeat    time.Duration
 	writeTimeout time.Duration // per write on a stream
 }
@@ -61,6 +72,7 @@ func NewServer(store LogStore, opts Options) *Server {
 		store:        store,
 		opts:         opts,
 		hub:          newHub(clientBuffer),
+		logins:       newLoginLimiter(),
 		heartbeat:    defaultHeartbeat,
 		writeTimeout: defaultStreamWriteTimeout,
 	}
@@ -68,6 +80,10 @@ func NewServer(store LogStore, opts Options) *Server {
 
 // SetupRoutes registers all HTTP routes and returns the handler.
 func (s *Server) SetupRoutes() http.Handler {
+	return s.router()
+}
+
+func (s *Server) router() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -76,15 +92,28 @@ func (s *Server) SetupRoutes() http.Handler {
 		r.Use(cors.Handler(cors.Options{
 			AllowedOrigins: s.opts.CORSAllowedOrigins,
 			AllowedMethods: []string{"GET", "POST", "OPTIONS"},
-			AllowedHeaders: []string{"Accept", "Content-Type"},
+			AllowedHeaders: []string{"Accept", "Authorization", "Content-Type"},
 			MaxAge:         300,
 		}))
 	}
 
 	r.Route("/api", func(r chi.Router) {
-		r.Get("/logs", s.GetLogsHandler)
-		r.Post("/logs", s.AddLogHandler)
-		r.Get("/logs/stream", s.StreamLogsHandler)
+		// Public: the dashboard needs these to log in.
+		r.Get("/session", s.GetSessionHandler)
+		r.Post("/session", s.LoginHandler)
+		r.Delete("/session", s.LogoutHandler)
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireRead)
+			r.Get("/logs", s.GetLogsHandler)
+			r.Get("/logs/stream", s.StreamLogsHandler)
+			r.Get("/facets", s.FacetsHandler)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireWrite)
+			r.Post("/logs", s.AddLogHandler)
+			r.Post("/logs/batch", s.AddLogsBatchHandler)
+		})
 	})
 
 	if s.opts.Static != nil {
@@ -105,10 +134,31 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// parseFilter reads level, type, limit and offset from the query string.
+const attrParamPrefix = "attr."
+
+// parseFilter reads level, type, service, q, attr.<key>, limit and offset
+// from the query string.
 func parseFilter(r *http.Request) (models.LogFilter, error) {
 	q := r.URL.Query()
-	filter := models.LogFilter{Level: q.Get("level"), Type: q.Get("type")}
+	filter := models.LogFilter{
+		Level:   q.Get("level"),
+		Type:    q.Get("type"),
+		Service: q.Get("service"),
+		Query:   q.Get("q"),
+	}
+	for key, vals := range q {
+		name, ok := strings.CutPrefix(key, attrParamPrefix)
+		if !ok {
+			continue
+		}
+		if len(vals) != 1 {
+			return filter, fmt.Errorf("%s given more than once", key)
+		}
+		if filter.Attrs == nil {
+			filter.Attrs = map[string]string{}
+		}
+		filter.Attrs[name] = vals[0]
+	}
 	if err := filter.Validate(); err != nil {
 		return filter, err
 	}
@@ -137,7 +187,8 @@ func internalError(w http.ResponseWriter, what string, err error) {
 
 // GetLogsHandler returns log entries with optional filtering and pagination.
 //
-// Query parameters: level, type, limit (default 100, max 500), offset (default 0).
+// Query parameters: level, type, service, q, attr.<key>, limit (default 100,
+// max 500), offset (default 0).
 func (s *Server) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r)
 	if err != nil {
@@ -154,23 +205,39 @@ func (s *Server) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 		logs = []models.Log{}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(logs); err != nil {
-		log.Printf("Error encoding logs response: %v", err)
+	writeJSON(w, http.StatusOK, logs)
+}
+
+// FacetsHandler returns the types and services seen in recent logs.
+func (s *Server) FacetsHandler(w http.ResponseWriter, r *http.Request) {
+	facets, err := s.store.Facets(r.Context())
+	if err != nil {
+		internalError(w, "facets", err)
+		return
 	}
+	writeJSON(w, http.StatusOK, facets)
+}
+
+// decodeBody reads JSON into v with a size cap. It writes the error response
+// itself and reports whether decoding succeeded.
+func decodeBody(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return false
+		}
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 // AddLogHandler inserts a new log entry.
 func (s *Server) AddLogHandler(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var logEntry models.Log
-	if err := json.NewDecoder(r.Body).Decode(&logEntry); err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+	if !decodeBody(w, r, maxBodyBytes, &logEntry) {
 		return
 	}
 	if err := logEntry.Validate(); err != nil {
@@ -183,16 +250,38 @@ func (s *Server) AddLogHandler(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "insert log", err)
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]int{"id": id})
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]int{"id": id}); err != nil {
-		log.Printf("Error encoding add log response: %v", err)
+// AddLogsBatchHandler inserts up to maxBatchEntries entries, all or none.
+// Body: a JSON array of entries. Response: {"ids": [...]} in input order.
+func (s *Server) AddLogsBatchHandler(w http.ResponseWriter, r *http.Request) {
+	var entries []models.Log
+	if !decodeBody(w, r, maxBatchBodyBytes, &entries) {
+		return
 	}
+	if len(entries) == 0 || len(entries) > maxBatchEntries {
+		http.Error(w, fmt.Sprintf("a batch holds 1 to %d entries", maxBatchEntries), http.StatusBadRequest)
+		return
+	}
+	for i := range entries {
+		if err := entries[i].Validate(); err != nil {
+			http.Error(w, fmt.Sprintf("entry %d: %v", i, err), http.StatusBadRequest)
+			return
+		}
+	}
+
+	ids, err := s.store.InsertLogs(r.Context(), entries)
+	if err != nil {
+		internalError(w, "insert logs", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]int{"ids": ids})
 }
 
 // StreamLogsHandler streams log entries to the client using Server-Sent Events.
 //
-// Query parameters: level, type (optional filters applied server-side).
+// Query parameters: the same filters as GetLogsHandler, applied server-side.
 // Besides `data:` events it sends `event: resync` when entries may have been
 // missed (the client should reload the list) and `: ping` comments as heartbeat.
 func (s *Server) StreamLogsHandler(w http.ResponseWriter, r *http.Request) {

@@ -90,6 +90,34 @@ func TestDSNIPv6Host(t *testing.T) {
 	}
 }
 
+func TestFromEnvAuthAndRetention(t *testing.T) {
+	cfg, err := fromEnv(envMap(map[string]string{
+		"GOLOG_WRITE_TOKEN": "write-0123456789", "GOLOG_READ_TOKEN": "read-0123456789ab",
+		"GOLOG_SECURE_COOKIES": "true", "GOLOG_RETENTION_DAYS": "30",
+	}))
+	if err != nil {
+		t.Fatalf("fromEnv() error: %v", err)
+	}
+	if cfg.WriteToken != "write-0123456789" || cfg.ReadToken != "read-0123456789ab" || !cfg.SecureCookies || cfg.RetentionDays != 30 {
+		t.Fatalf("unexpected config: %+v", cfg)
+	}
+}
+
+func TestDSNUnixSocket(t *testing.T) {
+	cfg := &Config{DBHost: "/var/run/postgresql", DBPort: "5433", DBUser: "u", DBPassword: "p w", DBName: "d", DBSSLMode: "disable"}
+	u, err := url.Parse(cfg.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	if u.Host != "" || q.Get("host") != "/var/run/postgresql" || q.Get("port") != "5433" || u.Path != "/d" {
+		t.Fatalf("DSN() = %q, want the socket directory in ?host=", cfg.DSN())
+	}
+	if pw, _ := u.User.Password(); pw != "p w" {
+		t.Fatalf("password = %q", pw)
+	}
+}
+
 func TestDatabaseURLWins(t *testing.T) {
 	cfg, err := fromEnv(envMap(map[string]string{
 		"DATABASE_URL": "postgres://x:y@remote/db?sslmode=require",
@@ -114,6 +142,13 @@ func TestFromEnvErrors(t *testing.T) {
 		{name: "negative port", env: map[string]string{"PORT": "-1"}, want: "PORT"},
 		{name: "bad sslmode", env: map[string]string{"DB_SSLMODE": "prefer"}, want: "DB_SSLMODE"},
 		{name: "bad auto migrate", env: map[string]string{"GOLOG_AUTO_MIGRATE": "maybe"}, want: "GOLOG_AUTO_MIGRATE"},
+		{name: "bad secure cookies", env: map[string]string{"GOLOG_SECURE_COOKIES": "yes please"}, want: "GOLOG_SECURE_COOKIES"},
+		{name: "retention not a number", env: map[string]string{"GOLOG_RETENTION_DAYS": "30d"}, want: "GOLOG_RETENTION_DAYS"},
+		{name: "negative retention", env: map[string]string{"GOLOG_RETENTION_DAYS": "-1"}, want: "GOLOG_RETENTION_DAYS"},
+		{name: "absurd retention", env: map[string]string{"GOLOG_RETENTION_DAYS": "999999"}, want: "GOLOG_RETENTION_DAYS"},
+		{name: "short write token", env: map[string]string{"GOLOG_WRITE_TOKEN": "short"}, want: "GOLOG_WRITE_TOKEN"},
+		{name: "short read token", env: map[string]string{"GOLOG_READ_TOKEN": "0123456789abcde"}, want: "GOLOG_READ_TOKEN"},
+		{name: "same token twice", env: map[string]string{"GOLOG_WRITE_TOKEN": "0123456789abcdef", "GOLOG_READ_TOKEN": "0123456789abcdef"}, want: "must differ"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -2,7 +2,9 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,7 +13,7 @@ import (
 	"github.com/mstgnz/golog/v2/models"
 )
 
-var logColumns = []string{"id", "timestamp", "level", "type", "message"}
+var logColumns = []string{"id", "timestamp", "level", "type", "service", "message", "attrs"}
 
 func newTestStore(t *testing.T) (*Store, sqlmock.Sqlmock) {
 	t.Helper()
@@ -23,22 +25,22 @@ func newTestStore(t *testing.T) (*Store, sqlmock.Sqlmock) {
 	return newStore(db, ""), mock
 }
 
-const byIDQuery = `SELECT id, timestamp, level, type, message FROM logs WHERE id = \$1`
+const byIDQuery = `SELECT id, timestamp, level, type, service, message, attrs FROM logs WHERE id = \$1`
 
 func TestGetLogByID(t *testing.T) {
 	t.Run("found", func(t *testing.T) {
 		store, mock := newTestStore(t)
 		ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 		mock.ExpectQuery(byIDQuery).WithArgs(7).
-			WillReturnRows(sqlmock.NewRows(logColumns).AddRow(7, ts, "INFO", "API", "hello"))
+			WillReturnRows(sqlmock.NewRows(logColumns).AddRow(7, ts, "INFO", "API", "billing", "hello", []byte(`{"a":1}`)))
 
 		got, err := store.GetLogByID(context.Background(), 7)
 		if err != nil {
 			t.Fatalf("GetLogByID() error: %v", err)
 		}
-		want := models.Log{ID: 7, Timestamp: ts, Level: "INFO", Type: "API", Message: "hello"}
-		if got != want {
-			t.Fatalf("GetLogByID() = %+v, want %+v", got, want)
+		if got.ID != 7 || !got.Timestamp.Equal(ts) || got.Level != "INFO" || got.Type != "API" ||
+			got.Service != "billing" || got.Message != "hello" || string(got.Attrs) != `{"a":1}` {
+			t.Fatalf("GetLogByID() = %+v", got)
 		}
 	})
 
@@ -54,7 +56,7 @@ func TestGetLogByID(t *testing.T) {
 	t.Run("null timestamp does not fail the read", func(t *testing.T) {
 		store, mock := newTestStore(t)
 		mock.ExpectQuery(byIDQuery).WithArgs(9).
-			WillReturnRows(sqlmock.NewRows(logColumns).AddRow(9, nil, "INFO", "API", "no ts"))
+			WillReturnRows(sqlmock.NewRows(logColumns).AddRow(9, nil, "INFO", "API", "", "no ts", []byte(`{}`)))
 
 		got, err := store.GetLogByID(context.Background(), 9)
 		if err != nil {
@@ -80,7 +82,7 @@ func TestEventFor(t *testing.T) {
 	t.Run("id payload loads the row", func(t *testing.T) {
 		store, mock := newTestStore(t)
 		mock.ExpectQuery(byIDQuery).WithArgs(42).
-			WillReturnRows(sqlmock.NewRows(logColumns).AddRow(42, time.Now(), "ERROR", "DATABASE", "boom"))
+			WillReturnRows(sqlmock.NewRows(logColumns).AddRow(42, time.Now(), "ERROR", "DATABASE", "", "boom", []byte(`{}`)))
 
 		ev, send := store.eventFor(ctx, &pq.Notification{Extra: "42"})
 		if !send || ev.Resync || ev.Log.ID != 42 || ev.Log.Message != "boom" {
@@ -163,154 +165,147 @@ func TestGetLogsQueryError(t *testing.T) {
 func TestGetLogsScanError(t *testing.T) {
 	store, mock := newTestStore(t)
 	mock.ExpectQuery(`SELECT id`).
-		WillReturnRows(sqlmock.NewRows(logColumns).AddRow("not-an-int", time.Now(), "INFO", "API", "x"))
+		WillReturnRows(sqlmock.NewRows(logColumns).AddRow("not-an-int", time.Now(), "INFO", "API", "", "x", []byte(`{}`)))
 	if _, err := store.GetLogs(context.Background(), models.LogFilter{}); err == nil {
 		t.Fatal("GetLogs() should return the scan error")
 	}
 }
 
-func TestGetLogs(t *testing.T) {
-	t.Run("NoFilters", func(t *testing.T) {
-		store, mock := newTestStore(t)
-
-		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 ORDER BY timestamp DESC, id DESC LIMIT \$1 OFFSET \$2`).
-			WithArgs(100, 0).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
-				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed").
-				AddRow(2, time.Now(), "INFO", "SYSTEM", "System started"))
-
-		logs, err := store.GetLogs(context.Background(), models.LogFilter{})
-		if err != nil {
-			t.Fatalf("GetLogs() error: %v", err)
-		}
-		if len(logs) != 2 {
-			t.Errorf("GetLogs() = %d logs, want 2", len(logs))
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("Unfulfilled expectations: %v", err)
-		}
-	})
-
-	t.Run("LevelFilter", func(t *testing.T) {
-		store, mock := newTestStore(t)
-
-		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND level = \$1 ORDER BY timestamp DESC, id DESC LIMIT \$2 OFFSET \$3`).
-			WithArgs("ERROR", 100, 0).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
-				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed"))
-
-		logs, err := store.GetLogs(context.Background(), models.LogFilter{Level: "ERROR"})
-		if err != nil {
-			t.Fatalf("GetLogs() error: %v", err)
-		}
-		if len(logs) != 1 {
-			t.Errorf("GetLogs() = %d logs, want 1", len(logs))
-		}
-		if logs[0].Level != "ERROR" {
-			t.Errorf("Log level = %s, want ERROR", logs[0].Level)
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("Unfulfilled expectations: %v", err)
-		}
-	})
-
-	t.Run("TypeFilter", func(t *testing.T) {
-		store, mock := newTestStore(t)
-
-		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND type = \$1 ORDER BY timestamp DESC, id DESC LIMIT \$2 OFFSET \$3`).
-			WithArgs("DATABASE", 100, 0).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
-				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed"))
-
-		logs, err := store.GetLogs(context.Background(), models.LogFilter{Type: "DATABASE"})
-		if err != nil {
-			t.Fatalf("GetLogs() error: %v", err)
-		}
-		if len(logs) != 1 {
-			t.Errorf("GetLogs() = %d logs, want 1", len(logs))
-		}
-		if logs[0].Type != "DATABASE" {
-			t.Errorf("Log type = %s, want DATABASE", logs[0].Type)
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("Unfulfilled expectations: %v", err)
-		}
-	})
-
-	t.Run("BothFilters", func(t *testing.T) {
-		store, mock := newTestStore(t)
-
-		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 AND level = \$1 AND type = \$2 ORDER BY timestamp DESC, id DESC LIMIT \$3 OFFSET \$4`).
-			WithArgs("ERROR", "DATABASE", 100, 0).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
-				AddRow(1, time.Now(), "ERROR", "DATABASE", "Connection failed"))
-
-		logs, err := store.GetLogs(context.Background(), models.LogFilter{Level: "ERROR", Type: "DATABASE"})
-		if err != nil {
-			t.Fatalf("GetLogs() error: %v", err)
-		}
-		if len(logs) != 1 || logs[0].Level != "ERROR" || logs[0].Type != "DATABASE" {
-			t.Errorf("GetLogs() returned unexpected result")
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("Unfulfilled expectations: %v", err)
-		}
-	})
-
-	t.Run("Pagination", func(t *testing.T) {
-		store, mock := newTestStore(t)
-
-		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 ORDER BY timestamp DESC, id DESC LIMIT \$1 OFFSET \$2`).
-			WithArgs(10, 20).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}).
-				AddRow(21, time.Now(), "INFO", "SYSTEM", "paged"))
-
-		logs, err := store.GetLogs(context.Background(), models.LogFilter{Limit: 10, Offset: 20})
-		if err != nil {
-			t.Fatalf("GetLogs() error: %v", err)
-		}
-		if len(logs) != 1 {
-			t.Errorf("GetLogs() = %d logs, want 1", len(logs))
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("Unfulfilled expectations: %v", err)
-		}
-	})
-
-	t.Run("LimitCappedAtMax", func(t *testing.T) {
-		store, mock := newTestStore(t)
-
-		mock.ExpectQuery(`SELECT id, timestamp, level, type, message FROM logs WHERE 1=1 ORDER BY timestamp DESC, id DESC LIMIT \$1 OFFSET \$2`).
-			WithArgs(maxLimit, 0).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "timestamp", "level", "type", "message"}))
-
-		_, err := store.GetLogs(context.Background(), models.LogFilter{Limit: 9999})
-		if err != nil {
-			t.Fatalf("GetLogs() error: %v", err)
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("Unfulfilled expectations: %v", err)
-		}
-	})
+func TestWhereClause(t *testing.T) {
+	tests := []struct {
+		name     string
+		filter   models.LogFilter
+		wantSQL  string
+		wantArgs []any
+	}{
+		{name: "empty", filter: models.LogFilter{}, wantSQL: "", wantArgs: nil},
+		{
+			name:     "exact fields",
+			filter:   models.LogFilter{Level: "ERROR", Type: "PAYMENT", Service: "billing"},
+			wantSQL:  " WHERE level = $1 AND type = $2 AND service = $3",
+			wantArgs: []any{"ERROR", "PAYMENT", "billing"},
+		},
+		{
+			name:     "query wildcards are escaped",
+			filter:   models.LogFilter{Query: `50%_off\now`},
+			wantSQL:  " WHERE message ILIKE $1",
+			wantArgs: []any{`%50\%\_off\\now%`},
+		},
+		{
+			name:     "attr number matches number or string",
+			filter:   models.LogFilter{Attrs: map[string]string{"user_id": "42"}},
+			wantSQL:  " WHERE (attrs @> $1::jsonb OR attrs @> $2::jsonb)",
+			wantArgs: []any{`{"user_id":"42"}`, `{"user_id":42}`},
+		},
+		{
+			name:     "attr text and sorted keys",
+			filter:   models.LogFilter{Level: "INFO", Attrs: map[string]string{"z": "a", "b": "x"}},
+			wantSQL:  " WHERE level = $1 AND (attrs @> $2::jsonb) AND (attrs @> $3::jsonb)",
+			wantArgs: []any{"INFO", `{"b":"x"}`, `{"z":"a"}`},
+		},
+		{
+			name:     "attr key with quotes is JSON-encoded, not spliced",
+			filter:   models.LogFilter{Attrs: map[string]string{`a"}'; DROP`: "v"}},
+			wantSQL:  " WHERE (attrs @> $1::jsonb)",
+			wantArgs: []any{`{"a\"}'; DROP":"v"}`},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sql, args, err := whereClause(tc.filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sql != tc.wantSQL {
+				t.Errorf("sql = %q, want %q", sql, tc.wantSQL)
+			}
+			if fmt.Sprint(args) != fmt.Sprint(tc.wantArgs) {
+				t.Errorf("args = %v, want %v", args, tc.wantArgs)
+			}
+		})
+	}
 }
 
-func TestInsertLog(t *testing.T) {
+func TestGetLogsLimitAndOffset(t *testing.T) {
+	tests := []struct {
+		name               string
+		filter             models.LogFilter
+		wantLimit, wantOff int
+	}{
+		{"default", models.LogFilter{}, defaultLimit, 0},
+		{"given", models.LogFilter{Limit: 10, Offset: 20}, 10, 20},
+		{"capped", models.LogFilter{Limit: 9999}, maxLimit, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store, mock := newTestStore(t)
+			mock.ExpectQuery(`SELECT id, timestamp, level, type, service, message, attrs FROM logs ORDER BY timestamp DESC, id DESC LIMIT \$1 OFFSET \$2`).
+				WithArgs(tc.wantLimit, tc.wantOff).
+				WillReturnRows(sqlmock.NewRows(logColumns))
+			if _, err := store.GetLogs(context.Background(), tc.filter); err != nil {
+				t.Fatal(err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+func TestInsertLogsBuildsOneStatement(t *testing.T) {
 	store, mock := newTestStore(t)
+	ts := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	entries := []models.Log{
+		{Level: "ERROR", Type: "DATABASE", Message: "first"},
+		{Timestamp: ts, Level: "INFO", Type: "API", Service: "web", Message: "second", Attrs: json.RawMessage(`{"a":1}`)},
+	}
+	mock.ExpectQuery(`INSERT INTO logs \(timestamp, level, type, service, message, attrs\) VALUES \(COALESCE\(\$1::timestamptz, now\(\)\), \$2, \$3, \$4, \$5, \$6::jsonb\), \(COALESCE\(\$7::timestamptz, now\(\)\), \$8, \$9, \$10, \$11, \$12::jsonb\) RETURNING id`).
+		WithArgs(nil, "ERROR", "DATABASE", "", "first", "{}", ts, "INFO", "API", "web", "second", `{"a":1}`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(7).AddRow(8))
 
-	logEntry := models.Log{Level: "ERROR", Type: "DATABASE", Message: "Connection failed"}
-
-	mock.ExpectQuery(`INSERT INTO logs \(level, type, message\) VALUES \(\$1, \$2, \$3\) RETURNING id`).
-		WithArgs(logEntry.Level, logEntry.Type, logEntry.Message).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
-
-	id, err := store.InsertLog(context.Background(), logEntry)
+	ids, err := store.InsertLogs(context.Background(), entries)
 	if err != nil {
-		t.Fatalf("InsertLog() error: %v", err)
+		t.Fatal(err)
 	}
-	if id != 1 {
-		t.Errorf("InsertLog() id = %d, want 1", id)
+	if fmt.Sprint(ids) != "[7 8]" {
+		t.Fatalf("ids = %v", ids)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("Unfulfilled expectations: %v", err)
+}
+
+func TestInsertLogsRowCountMismatch(t *testing.T) {
+	store, mock := newTestStore(t)
+	mock.ExpectQuery(`INSERT INTO logs`).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(7))
+	if _, err := store.InsertLogs(context.Background(), []models.Log{{Message: "a"}, {Message: "b"}}); err == nil {
+		t.Fatal("InsertLogs() should fail when fewer ids come back than rows were sent")
+	}
+}
+
+func TestInsertLogsEmpty(t *testing.T) {
+	store, _ := newTestStore(t) // no query expected
+	if ids, err := store.InsertLogs(context.Background(), nil); err != nil || ids != nil {
+		t.Fatalf("InsertLogs(nil) = %v, %v", ids, err)
+	}
+}
+
+func TestInsertLogError(t *testing.T) {
+	store, mock := newTestStore(t)
+	mock.ExpectQuery(`INSERT INTO logs`).WillReturnError(errors.New("db down"))
+	if _, err := store.InsertLog(context.Background(), models.Log{Message: "a"}); err == nil {
+		t.Fatal("InsertLog() should return the insert error")
+	}
+}
+
+func TestFacetsErrors(t *testing.T) {
+	store, mock := newTestStore(t)
+	mock.ExpectQuery(`SELECT DISTINCT type`).WillReturnError(errors.New("db down"))
+	if _, err := store.Facets(context.Background()); err == nil {
+		t.Fatal("Facets() should return the error")
+	}
+
+	store, mock = newTestStore(t)
+	mock.ExpectQuery(`SELECT DISTINCT type`).WillReturnRows(sqlmock.NewRows([]string{"type"}).AddRow("API"))
+	mock.ExpectQuery(`SELECT DISTINCT service`).WillReturnError(errors.New("db down"))
+	if _, err := store.Facets(context.Background()); err == nil {
+		t.Fatal("Facets() should return the second error")
 	}
 }

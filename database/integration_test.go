@@ -3,9 +3,11 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -123,21 +125,351 @@ func TestIntegrationMigrateIsIdempotent(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(versions) != "[1 2]" {
-		t.Fatalf("applied versions = %v, want [1 2]", versions)
+	if fmt.Sprint(versions) != "[1 2 3 4]" {
+		t.Fatalf("applied versions = %v, want [1 2 3 4]", versions)
 	}
 
-	var valid bool
-	err = d.admin.QueryRow(`
-		SELECT i.indisvalid FROM pg_index i
-		JOIN pg_class c ON c.oid = i.indexrelid
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relname = 'logs_timestamp_id_idx'`, d.schema).Scan(&valid)
-	if err != nil {
-		t.Fatalf("index logs_timestamp_id_idx not found: %v", err)
+	for _, idx := range []string{"logs_timestamp_id_idx", "logs_attrs_idx"} {
+		var valid bool
+		err = d.admin.QueryRow(`
+			SELECT i.indisvalid FROM pg_index i
+			JOIN pg_class c ON c.oid = i.indexrelid
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2`, d.schema, idx).Scan(&valid)
+		if err != nil {
+			t.Fatalf("index %s not found: %v", idx, err)
+		}
+		if !valid {
+			t.Fatalf("index %s is INVALID", idx)
+		}
 	}
-	if !valid {
-		t.Fatal("index logs_timestamp_id_idx is INVALID")
+}
+
+// seedFilterRows inserts the rows the filter parity test runs against.
+func seedFilterRows(t *testing.T, s *Store) []models.Log {
+	t.Helper()
+	rows := []models.Log{
+		{Level: "ERROR", Type: "PAYMENT", Service: "billing", Message: "Card DECLINED for order 7", Attrs: json.RawMessage(`{"user_id":42,"code":"042","ok":false}`)},
+		{Level: "INFO", Type: "PAYMENT", Service: "billing", Message: "card approved", Attrs: json.RawMessage(`{"user_id":"42","ratio":1.5}`)},
+		{Level: "INFO", Type: "AUTH", Service: "web", Message: "50% off_sale \\ done", Attrs: json.RawMessage(`{"gone":null,"nested":{"a":1}}`)},
+		{Level: "DEBUG", Type: "payment", Service: "", Message: "Grüße ÜBER alles", Attrs: json.RawMessage(`{}`)},
+		{Level: "WARNING", Type: "API", Service: "web", Message: "plain", Attrs: json.RawMessage(`{"user_id":43,"tags":["a","b"]}`)},
+	}
+	if _, err := s.InsertLogs(context.Background(), rows); err != nil {
+		t.Fatal(err)
+	}
+	all, err := s.GetLogs(context.Background(), models.LogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return all
+}
+
+// The list (SQL) and the live stream (Go Matches) must select the same rows
+// for every filter, or the dashboard shows different results on reload.
+func TestIntegrationFilterParitySQLAndGo(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	all := seedFilterRows(t, d.store)
+
+	attr := func(k, v string) map[string]string { return map[string]string{k: v} }
+	filters := []models.LogFilter{
+		{Level: "INFO"},
+		{Type: "PAYMENT"},
+		{Type: "payment"},
+		{Service: "web"},
+		{Query: "card declined"},
+		{Query: "CARD"},
+		{Query: "50%"},
+		{Query: "off_sale"},
+		{Query: `\`},
+		{Query: "%"},
+		{Query: "grüße über"},
+		{Attrs: attr("user_id", "42")},
+		{Attrs: attr("user_id", "42.0")},
+		{Attrs: attr("user_id", "43")},
+		{Attrs: attr("code", "042")},
+		{Attrs: attr("code", "42")},
+		{Attrs: attr("ok", "false")},
+		{Attrs: attr("gone", "null")},
+		{Attrs: attr("ratio", "1.50")},
+		{Attrs: attr("tags", "a")},
+		{Attrs: attr("nested", `{"a":1}`)},
+		{Attrs: attr("missing", "x")},
+		{Level: "ERROR", Service: "billing", Query: "order", Attrs: map[string]string{"user_id": "42", "ok": "false"}},
+	}
+	for _, f := range filters {
+		got, err := d.store.GetLogs(context.Background(), f)
+		if err != nil {
+			t.Fatalf("GetLogs(%+v): %v", f, err)
+		}
+		var sqlIDs, goIDs []int
+		for _, l := range got {
+			sqlIDs = append(sqlIDs, l.ID)
+		}
+		for _, l := range all {
+			if f.Matches(l) {
+				goIDs = append(goIDs, l.ID)
+			}
+		}
+		if fmt.Sprint(sqlIDs) != fmt.Sprint(goIDs) {
+			t.Errorf("filter %+v: SQL selected %v, Go selected %v", f, sqlIDs, goIDs)
+		}
+	}
+}
+
+func TestIntegrationAttrFilterUsesGINIndex(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	if _, err := d.store.db.Exec(`
+		INSERT INTO logs (level, type, message, attrs)
+		SELECT 'INFO', 'API', 'm', jsonb_build_object('trace_id', 't' || g, 'n', g)
+		FROM generate_series(1, 20000) g`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.store.db.Exec("ANALYZE logs"); err != nil {
+		t.Fatal(err)
+	}
+	where, args, err := whereClause(models.LogFilter{Attrs: map[string]string{"trace_id": "t777"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := d.store.db.Query("EXPLAIN SELECT id FROM logs"+where, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.String(), "logs_attrs_idx") {
+		t.Fatalf("attr filter does not use logs_attrs_idx:\n%s", plan.String())
+	}
+}
+
+func TestIntegrationBatchInsertNotifiesEachRow(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	events := listen(t, d.store)
+
+	ids, err := d.store.InsertLogs(context.Background(), []models.Log{
+		{Level: "INFO", Type: "A", Message: "one"},
+		{Level: "INFO", Type: "B", Service: "svc", Message: "two", Attrs: json.RawMessage(`{"k":"v"}`)},
+		{Level: "INFO", Type: "C", Message: "three"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 3 || !(ids[0] < ids[1] && ids[1] < ids[2]) {
+		t.Fatalf("ids = %v, want 3 increasing ids in input order", ids)
+	}
+	for i, want := range []string{"one", "two", "three"} {
+		ev := nextEvent(t, events)
+		if ev.Log.ID != ids[i] || ev.Log.Message != want {
+			t.Fatalf("event %d = %+v, want id %d %q", i, ev.Log, ids[i], want)
+		}
+	}
+}
+
+func TestIntegrationClientTimestampKept(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	ctx := context.Background()
+	client := time.Date(2026, 1, 2, 3, 4, 5, 123456000, time.UTC)
+	ids, err := d.store.InsertLogs(ctx, []models.Log{
+		{Timestamp: client, Level: "INFO", Type: "A", Message: "with time"},
+		{Level: "INFO", Type: "A", Message: "without time"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withTime, err := d.store.GetLogByID(ctx, ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !withTime.Timestamp.Equal(client) {
+		t.Fatalf("timestamp = %v, want the client's %v", withTime.Timestamp, client)
+	}
+	without, err := d.store.GetLogByID(ctx, ids[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(without.Timestamp) > time.Minute || without.Timestamp.IsZero() {
+		t.Fatalf("timestamp = %v, want the server's now()", without.Timestamp)
+	}
+}
+
+// Review finding: the raw attrs bytes went to jsonb, which refuses escapes
+// Go's decoder accepts. Storage must use the re-encoded form.
+func TestIntegrationAttrsThatJsonbRefusesRaw(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	ctx := context.Background()
+	entry := models.Log{Level: "INFO", Type: "A", Message: "m", Attrs: json.RawMessage(`{"a":"x\ud800y","n":1.50}`)}
+	if err := entry.Validate(); err != nil {
+		t.Fatalf("precondition: Validate() = %v", err)
+	}
+	ids, err := d.store.InsertLogs(ctx, []models.Log{entry})
+	if err != nil {
+		t.Fatalf("InsertLogs() = %v; a validated entry must store", err)
+	}
+	got, err := d.store.GetLogByID(ctx, ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attrs map[string]any
+	if err := json.Unmarshal(got.Attrs, &attrs); err != nil || attrs["a"] != "x�y" {
+		t.Fatalf("stored attrs = %s", got.Attrs)
+	}
+
+	// A filter value outside numeric range must not break the query.
+	if _, err := d.store.GetLogs(ctx, models.LogFilter{Attrs: map[string]string{"n": "1e999999"}}); err != nil {
+		t.Fatalf("GetLogs(attr.n=1e999999) = %v", err)
+	}
+}
+
+// Same class: a query-string value with invalid UTF-8 (?q=%FF) reaches
+// PostgreSQL as text it refuses. Filter validation must stop it first.
+func TestIntegrationInvalidUTF8FilterIsRejectedBeforeSQL(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	f := models.LogFilter{Query: "\xff"}
+	if _, err := d.store.GetLogs(context.Background(), f); err == nil {
+		t.Fatal("precondition: PostgreSQL should refuse invalid UTF-8")
+	}
+	if err := f.Validate(); err == nil {
+		t.Fatal("LogFilter.Validate() must reject invalid UTF-8")
+	}
+}
+
+func TestIntegrationBatchInsertIsAllOrNothing(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	_, err := d.store.InsertLogs(context.Background(), []models.Log{
+		{Level: "INFO", Type: "A", Message: "kept?"},
+		{Level: "INFO", Type: strings.Repeat("x", 60), Message: "type too long for varchar(50)"},
+	})
+	if err == nil {
+		t.Fatal("InsertLogs() should fail")
+	}
+	logs, err := d.store.GetLogs(context.Background(), models.LogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("a failed batch left %d rows behind", len(logs))
+	}
+}
+
+func TestIntegrationFacets(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	seedFilterRows(t, d.store)
+	f, err := d.store.Facets(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Order follows the database collation; compare as sets.
+	types := append([]string(nil), f.Types...)
+	sort.Strings(types)
+	if fmt.Sprint(types) != "[API AUTH PAYMENT payment]" || fmt.Sprint(f.Services) != "[billing web]" {
+		t.Fatalf("facets = %+v", f)
+	}
+}
+
+func TestIntegrationRetention(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	ctx := context.Background()
+	if _, err := d.store.db.Exec(`
+		INSERT INTO logs (timestamp, level, type, message)
+		SELECT now() - interval '40 days', 'INFO', 'OLD', 'old' FROM generate_series(1, 7);
+		INSERT INTO logs (timestamp, level, type, message) VALUES
+			(now() - interval '1 day', 'INFO', 'NEW', 'new'),
+			(NULL, 'INFO', 'NULL', 'no timestamp');`); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := d.store.DeleteOlderThan(ctx, time.Now().Add(-30*24*time.Hour), 3) // 3+3+1: several batches
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 7 {
+		t.Fatalf("deleted %d rows, want 7", n)
+	}
+	left, err := d.store.GetLogs(ctx, models.LogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	for _, l := range left {
+		types = append(types, l.Type)
+	}
+	sort.Strings(types)
+	if fmt.Sprint(types) != "[NEW NULL]" {
+		t.Fatalf("rows left = %v, want the new row and the NULL-timestamp row", types)
+	}
+}
+
+func TestIntegrationRetentionRound(t *testing.T) {
+	d := newIntegrationDB(t)
+	d.migrate(t)
+	ctx := context.Background()
+	if _, err := d.store.db.Exec(`INSERT INTO logs (timestamp, level, type, message) VALUES (now() - interval '2 days', 'INFO', 'OLD', 'old')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another instance holds the lock: this one skips the round.
+	holder, err := d.store.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.ExecContext(ctx, "SELECT pg_advisory_lock($1)", retentionLockID); err != nil {
+		t.Fatal(err)
+	}
+	if n, ran, err := d.store.retentionRound(ctx, 24*time.Hour); err != nil || ran || n != 0 {
+		t.Fatalf("retentionRound() with the lock taken = %d, %v, %v; want a skipped round", n, ran, err)
+	}
+	if _, err := holder.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", retentionLockID); err != nil {
+		t.Fatal(err)
+	}
+	holder.Close()
+
+	// RunRetention runs a round right away and stops with ctx.
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		d.store.RunRetention(runCtx, 24*time.Hour, time.Hour)
+		close(done)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		logs, err := d.store.GetLogs(ctx, models.LogFilter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(logs) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("RunRetention did not delete the old row")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunRetention did not stop after cancel")
 	}
 }
 
@@ -334,6 +666,9 @@ func TestIntegrationUpgradeFromV1(t *testing.T) {
 	}
 	if len(logs) != 1 || logs[0].Message != "from v1" {
 		t.Fatalf("existing rows not kept: %+v", logs)
+	}
+	if logs[0].Service != "" || string(logs[0].Attrs) != "{}" {
+		t.Fatalf("old row should read as service '' and attrs {}, got %q %s", logs[0].Service, logs[0].Attrs)
 	}
 	if _, err := d.store.InsertLog(context.Background(), models.Log{Level: "INFO", Type: "API", Message: big}); err != nil {
 		t.Fatalf("9000-byte insert after upgrade: %v", err)

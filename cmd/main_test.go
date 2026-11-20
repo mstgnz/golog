@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mstgnz/golog/v2/config"
 	"github.com/mstgnz/golog/v2/handlers"
 	"github.com/mstgnz/golog/v2/models"
 )
@@ -20,6 +23,12 @@ func (f *fakeStore) GetLogs(context.Context, models.LogFilter) ([]models.Log, er
 }
 
 func (f *fakeStore) InsertLog(context.Context, models.Log) (int, error) { return 1, nil }
+
+func (f *fakeStore) InsertLogs(_ context.Context, entries []models.Log) ([]int, error) {
+	return make([]int, len(entries)), nil
+}
+
+func (f *fakeStore) Facets(context.Context) (models.Facets, error) { return models.Facets{}, nil }
 
 func (f *fakeStore) ListenForLogs(ctx context.Context, ch chan<- models.LogEvent) error {
 	if f.listenErr != nil {
@@ -126,15 +135,31 @@ func TestNewHTTPServerTimeouts(t *testing.T) {
 
 func TestRunConfigError(t *testing.T) {
 	t.Setenv("PORT", "not-a-port")
-	if err := run(context.Background()); err == nil || !strings.Contains(err.Error(), "load config") {
+	if err := run(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "load config") {
 		t.Fatalf("run() = %v, want a config error", err)
+	}
+}
+
+func TestWarnIfOpen(t *testing.T) {
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	warnIfOpen(&config.Config{})
+	if !strings.Contains(buf.String(), "GOLOG_READ_TOKEN is not set") || !strings.Contains(buf.String(), "GOLOG_WRITE_TOKEN is not set") {
+		t.Fatalf("missing warnings: %q", buf.String())
+	}
+	buf.Reset()
+	warnIfOpen(&config.Config{ReadToken: "r", WriteToken: "w"})
+	if buf.Len() != 0 {
+		t.Fatalf("unexpected warning with both tokens set: %q", buf.String())
 	}
 }
 
 func TestRunDatabaseError(t *testing.T) {
 	// Port 1 on loopback refuses connections immediately.
 	t.Setenv("DATABASE_URL", "postgres://u:p@127.0.0.1:1/db?sslmode=disable&connect_timeout=2")
-	if err := run(context.Background()); err == nil || !strings.Contains(err.Error(), "connect to database") {
+	if err := run(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "connect to database") {
 		t.Fatalf("run() = %v, want a connection error", err)
 	}
 }

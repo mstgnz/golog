@@ -18,11 +18,14 @@ import (
 	"github.com/mstgnz/golog/v2/web"
 )
 
-const shutdownTimeout = 10 * time.Second
+const (
+	shutdownTimeout   = 10 * time.Second
+	retentionInterval = time.Hour
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx)
+	err := run(ctx, nil)
 	stop()
 	if err != nil {
 		log.Printf("golog: %v", err)
@@ -30,7 +33,9 @@ func main() {
 	}
 }
 
-func run(ctx context.Context) error {
+// run serves until ctx ends. onListen, when set, receives the bound address
+// (tests use PORT=0).
+func run(ctx context.Context, onListen func(net.Addr)) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -48,9 +53,31 @@ func run(ctx context.Context) error {
 		}
 	}
 
+	if cfg.RetentionDays > 0 {
+		keep := time.Duration(cfg.RetentionDays) * 24 * time.Hour
+		retentionCtx, stopRetention := context.WithCancel(ctx)
+		retentionDone := make(chan struct{})
+		go func() {
+			defer close(retentionDone)
+			store.RunRetention(retentionCtx, keep, retentionInterval)
+		}()
+		// Runs before store.Close: no retention query may outlive the pool.
+		defer func() {
+			stopRetention()
+			<-retentionDone
+		}()
+		log.Printf("golog: retention on, deleting logs older than %d days every %s", cfg.RetentionDays, retentionInterval)
+	}
+
+	warnIfOpen(cfg)
 	app := handlers.NewServer(store, handlers.Options{
 		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
 		Static:             web.Static(),
+		Auth: handlers.Auth{
+			WriteToken:    cfg.WriteToken,
+			ReadToken:     cfg.ReadToken,
+			SecureCookies: cfg.SecureCookies,
+		},
 	})
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Port))
@@ -58,7 +85,20 @@ func run(ctx context.Context) error {
 		return err
 	}
 	log.Printf("golog: listening on %s", ln.Addr())
+	if onListen != nil {
+		onListen(ln.Addr())
+	}
 	return serve(ctx, ln, app)
+}
+
+// warnIfOpen says loudly which side of the API anyone can use.
+func warnIfOpen(cfg *config.Config) {
+	if cfg.ReadToken == "" {
+		log.Println("golog: WARNING: GOLOG_READ_TOKEN is not set; anyone who can reach this server can read all logs")
+	}
+	if cfg.WriteToken == "" {
+		log.Println("golog: WARNING: GOLOG_WRITE_TOKEN is not set; anyone who can reach this server can write logs")
+	}
 }
 
 // newHTTPServer sets timeouts for ordinary requests. The SSE handler lifts

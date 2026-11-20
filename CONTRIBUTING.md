@@ -61,13 +61,19 @@ add pagination support for GetLogs
 fix nil slice encoding in GetLogsHandler
 ```
 
-## Log levels and types
+## Log fields and filters
 
-Valid log levels: `INFO`, `WARNING`, `ERROR`, `DEBUG`
+Levels are fixed: `INFO`, `WARNING`, `ERROR`, `DEBUG`. Type, service and attrs are free-form within the limits in `models/log.go`, enforced by `Log.Validate()`.
 
-Valid log types: `SYSTEM`, `AUTH`, `DATABASE`, `USER`, `API`
+A filter is applied twice: in SQL for the list (`database.whereClause`) and in Go for the live stream (`models.LogFilter.Matches`). Change both together; `TestIntegrationFilterParitySQLAndGo` fails when they disagree.
 
-These are defined as constants in `models/log.go` and enforced by `Log.Validate()`.
+## The `gologslog` package
+
+It is the public library other projects import, so it uses the standard library only. It mirrors the server's validation limits: the batch endpoint rejects a whole batch for one bad entry, so the handler must never build one. `TestRealServerAcceptsWhatTheHandlerSends` checks that against the real handlers.
+
+## Routes and auth
+
+Every `/api` route needs the read or the write token unless it is listed in `publicAPIRoutes` in `handlers/auth_test.go` with a reason. `TestEveryAPIRouteRequiresAToken` walks the router and fails for a new route that forgets this.
 
 ## Reporting issues
 

@@ -113,6 +113,11 @@ func migrate(ctx context.Context, db *sql.DB, migrations []migration) error {
 			continue
 		}
 		if err := applyMigration(ctx, conn, m); err != nil {
+			if m.noTx {
+				// A failed or interrupted CREATE INDEX CONCURRENTLY leaves an
+				// index behind that makes every retry fail.
+				return fmt.Errorf("migration %s: %w (this migration runs outside a transaction; if it creates an index, run DROP INDEX CONCURRENTLY IF EXISTS on that index and restart)", m.name, err)
+			}
 			return fmt.Errorf("migration %s: %w", m.name, err)
 		}
 	}

@@ -98,9 +98,74 @@ tr:hover {
     background-color: #f5f5f5;
 }
 
+[hidden] {
+    display: none !important;
+}
+
+input[type="search"],
+input[type="password"],
+.form-group input {
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+}
+
+.form-group input,
+.attrs-input {
+    width: 100%;
+    font-family: inherit;
+}
+
+.filters {
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.login {
+    max-width: 420px;
+    margin: 40px auto;
+    background-color: #fff;
+    padding: 24px;
+    border-radius: 5px;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+}
+
+.login p {
+    margin: 10px 0;
+}
+
+.login form {
+    display: flex;
+    gap: 10px;
+}
+
+.login input {
+    flex: 1;
+}
+
+.link-button {
+    background: none;
+    color: #3498db;
+    padding: 0 0 0 10px;
+}
+
+.link-button:hover {
+    background: none;
+    text-decoration: underline;
+}
+
 td.message {
     white-space: pre-wrap;
     word-break: break-word;
+}
+
+td.message .attrs {
+    margin-top: 4px;
+    font-family: Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #666;
+    white-space: pre-wrap;
 }
 
 td.empty {

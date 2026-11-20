@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GoLog - Real-time Log Monitoring</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,48 +13,72 @@
             <h1>GoLog</h1>
             <p>Real-time Log Monitoring Tool</p>
             <span id="status" class="status">connecting...</span>
+            <button id="logout-btn" class="link-button" hidden>Log out</button>
         </header>
 
-        <div class="filters">
-            <div class="filter-group">
-                <label for="level-filter">Level:</label>
-                <select id="level-filter">
-                    <option value="">All Levels</option>
-                    <option value="INFO">INFO</option>
-                    <option value="WARNING">WARNING</option>
-                    <option value="ERROR">ERROR</option>
-                    <option value="DEBUG">DEBUG</option>
-                </select>
-            </div>
-            <div class="filter-group">
-                <label for="type-filter">Type:</label>
-                <select id="type-filter">
-                    <option value="">All Types</option>
-                    <option value="SYSTEM">SYSTEM</option>
-                    <option value="AUTH">AUTH</option>
-                    <option value="DATABASE">DATABASE</option>
-                    <option value="USER">USER</option>
-                    <option value="API">API</option>
-                </select>
-            </div>
-            <button id="add-log-btn">Add Log</button>
-        </div>
+        <section id="login" class="login" hidden>
+            <h2>Sign in</h2>
+            <p>Enter the read token (GOLOG_READ_TOKEN) of this server.</p>
+            <form id="login-form">
+                <input id="login-token" type="password" autocomplete="current-password" required aria-label="Read token">
+                <button type="submit">Sign in</button>
+            </form>
+            <p id="login-error" class="form-error" hidden></p>
+        </section>
 
-        <div class="log-container">
-            <table id="log-table">
-                <thead>
-                    <tr>
-                        <th>Timestamp</th>
-                        <th>Level</th>
-                        <th>Type</th>
-                        <th>Message</th>
-                    </tr>
-                </thead>
-                <tbody id="log-body">
-                    <!-- Logs will be inserted here -->
-                </tbody>
-            </table>
-        </div>
+        <main id="app" hidden>
+            <div class="filters">
+                <div class="filter-group">
+                    <label for="level-filter">Level:</label>
+                    <select id="level-filter">
+                        <option value="">All Levels</option>
+                        <option value="INFO">INFO</option>
+                        <option value="WARNING">WARNING</option>
+                        <option value="ERROR">ERROR</option>
+                        <option value="DEBUG">DEBUG</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="type-filter">Type:</label>
+                    <select id="type-filter">
+                        <option value="">All Types</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="service-filter">Service:</label>
+                    <select id="service-filter">
+                        <option value="">All Services</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="search-filter">Text:</label>
+                    <input id="search-filter" type="search" maxlength="200" placeholder="message contains">
+                </div>
+                <div class="filter-group">
+                    <label for="attr-filter">Attr:</label>
+                    <input id="attr-filter" type="search" maxlength="200" placeholder="key=value">
+                </div>
+                <button id="add-log-btn" hidden>Add Log</button>
+            </div>
+            <p id="filter-error" class="form-error" hidden></p>
+
+            <div class="log-container">
+                <table id="log-table">
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Level</th>
+                            <th>Type</th>
+                            <th>Service</th>
+                            <th>Message</th>
+                        </tr>
+                    </thead>
+                    <tbody id="log-body">
+                        <!-- Logs will be inserted here -->
+                    </tbody>
+                </table>
+            </div>
+        </main>
     </div>
 
     <div id="add-log-modal" class="modal">
@@ -72,17 +97,21 @@
                 </div>
                 <div class="form-group">
                     <label for="log-type">Type:</label>
-                    <select id="log-type" required>
-                        <option value="SYSTEM">SYSTEM</option>
-                        <option value="AUTH">AUTH</option>
-                        <option value="DATABASE">DATABASE</option>
-                        <option value="USER">USER</option>
-                        <option value="API">API</option>
-                    </select>
+                    <input id="log-type" list="type-options" required maxlength="50" value="SYSTEM">
+                    <datalist id="type-options"></datalist>
+                </div>
+                <div class="form-group">
+                    <label for="log-service">Service (optional):</label>
+                    <input id="log-service" list="service-options" maxlength="100">
+                    <datalist id="service-options"></datalist>
                 </div>
                 <div class="form-group">
                     <label for="log-message">Message:</label>
                     <textarea id="log-message" required maxlength="10000"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="log-attrs">Attributes (optional JSON object):</label>
+                    <textarea id="log-attrs" class="attrs-input" placeholder='{"user_id": 42}'></textarea>
                 </div>
                 <p id="form-error" class="form-error" hidden></p>
                 <button type="submit">Add Log</button>

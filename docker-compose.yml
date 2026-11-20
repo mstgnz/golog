@@ -6,8 +6,9 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: golog
+    # Loopback only: the default password must not be reachable from the network.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -32,8 +33,13 @@ services:
       DB_PASSWORD: postgres
       DB_NAME: golog
       PORT: 8080
+      # Set both before exposing GoLog beyond this machine (16+ characters each):
+      # GOLOG_READ_TOKEN: ...
+      # GOLOG_WRITE_TOKEN: ...
+      # GOLOG_RETENTION_DAYS: 30
+    # Loopback only by default; change to "8080:8080" once tokens are set.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
 volumes:
   postgres_data:

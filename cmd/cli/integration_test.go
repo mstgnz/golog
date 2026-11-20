@@ -98,7 +98,7 @@ func TestIntegrationRunStreamsNewLogs(t *testing.T) {
 	defer cancel()
 	out := &syncBuffer{}
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, []string{"-level=error"}, out, io.Discard) }()
+	go func() { done <- run(ctx, []string{"-level=error"}, noEnv, out, io.Discard) }()
 
 	waitForOutput(t, out, "Listening for new logs")
 	if !strings.Contains(out.String(), "history-entry") {
@@ -129,7 +129,7 @@ func TestIntegrationRunStreamsNewLogs(t *testing.T) {
 
 func TestIntegrationRunWithoutSchema(t *testing.T) {
 	schemaDSN(t) // empty schema: golog-server never ran
-	err := run(context.Background(), nil, io.Discard, io.Discard)
+	err := run(context.Background(), nil, noEnv, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "start golog-server once") {
 		t.Fatalf("run() = %v, want a hint to start the server", err)
 	}

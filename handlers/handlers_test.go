@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -25,6 +27,9 @@ type mockStore struct {
 	gotFilter models.LogFilter
 	insertID  int
 	insertErr error
+	batch     []models.Log
+	facets    models.Facets
+	facetsErr error
 	listenErr error
 	source    chan models.LogEvent
 }
@@ -36,6 +41,22 @@ func (m *mockStore) GetLogs(_ context.Context, filter models.LogFilter) ([]model
 
 func (m *mockStore) InsertLog(_ context.Context, _ models.Log) (int, error) {
 	return m.insertID, m.insertErr
+}
+
+func (m *mockStore) InsertLogs(_ context.Context, entries []models.Log) ([]int, error) {
+	if m.insertErr != nil {
+		return nil, m.insertErr
+	}
+	m.batch = entries
+	ids := make([]int, len(entries))
+	for i := range ids {
+		ids[i] = m.insertID + i
+	}
+	return ids, nil
+}
+
+func (m *mockStore) Facets(context.Context) (models.Facets, error) {
+	return m.facets, m.facetsErr
 }
 
 func (m *mockStore) ListenForLogs(ctx context.Context, ch chan<- models.LogEvent) error {
@@ -179,8 +200,8 @@ func TestGetLogsHandler(t *testing.T) {
 			statusCode: http.StatusBadRequest,
 		},
 		{
-			name:       "invalid type filter",
-			query:      "type=NETWORK",
+			name:       "type filter too long",
+			query:      "type=" + strings.Repeat("t", models.MaxTypeLength+1),
 			statusCode: http.StatusBadRequest,
 		},
 		{
@@ -242,12 +263,124 @@ func TestGetLogsHandler(t *testing.T) {
 
 func TestGetLogsHandlerPassesFilter(t *testing.T) {
 	ms := &mockStore{}
-	req := httptest.NewRequest("GET", "/api/logs?level=ERROR&type=AUTH&limit=5&offset=10", nil)
-	newTestServer(ms).GetLogsHandler(httptest.NewRecorder(), req)
-	want := models.LogFilter{Level: "ERROR", Type: "AUTH", Limit: 5, Offset: 10}
-	if ms.gotFilter != want {
+	q := url.Values{
+		"level": {"ERROR"}, "type": {"PAYMENT"}, "service": {"billing"}, "q": {"card declined"},
+		"attr.user_id": {"42"}, "attr.trace id": {"a b"}, "limit": {"5"}, "offset": {"10"},
+	}
+	req := httptest.NewRequest("GET", "/api/logs?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	newTestServer(ms).GetLogsHandler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	want := models.LogFilter{
+		Level: "ERROR", Type: "PAYMENT", Service: "billing", Query: "card declined",
+		Attrs: map[string]string{"user_id": "42", "trace id": "a b"}, Limit: 5, Offset: 10,
+	}
+	if !reflect.DeepEqual(ms.gotFilter, want) {
 		t.Fatalf("store got filter %+v, want %+v", ms.gotFilter, want)
 	}
+}
+
+func TestParseFilterErrors(t *testing.T) {
+	tests := map[string]string{
+		"repeated attr":   "attr.a=1&attr.a=2",
+		"too many attrs":  "attr.a=1&attr.b=1&attr.c=1&attr.d=1&attr.e=1&attr.f=1",
+		"empty attr key":  "attr.=1",
+		"query too long":  "q=" + strings.Repeat("x", models.MaxQueryLength+1),
+		"lowercase level": "level=error",
+		"invalid UTF-8":   "q=%FF",
+	}
+	for name, query := range tests {
+		t.Run(name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			newTestServer(&mockStore{}).GetLogsHandler(rr, httptest.NewRequest("GET", "/api/logs?"+query, nil))
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rr.Code)
+			}
+		})
+	}
+}
+
+func TestAddLogHandlerAcceptsServiceAndAttrs(t *testing.T) {
+	rr := httptest.NewRecorder()
+	body := `{"level":"INFO","type":"PAYMENT","service":"billing","message":"ok","attrs":{"user_id":42}}`
+	newTestServer(&mockStore{insertID: 3}).AddLogHandler(rr, httptest.NewRequest("POST", "/api/logs", strings.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAddLogHandlerRejectsNUL(t *testing.T) {
+	rr := httptest.NewRecorder()
+	body := `{"level":"INFO","type":"API","message":"a\u0000b"}`
+	newTestServer(&mockStore{}).AddLogHandler(rr, httptest.NewRequest("POST", "/api/logs", strings.NewReader(body)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a NUL character", rr.Code)
+	}
+}
+
+func TestAddLogHandlerRejectsNumberJsonbCannotStore(t *testing.T) {
+	rr := httptest.NewRecorder()
+	body := `{"level":"INFO","type":"API","message":"m","attrs":{"n":1e1000000}}`
+	newTestServer(&mockStore{}).AddLogHandler(rr, httptest.NewRequest("POST", "/api/logs", strings.NewReader(body)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 instead of a database error", rr.Code)
+	}
+}
+
+func TestAddLogsBatchHandler(t *testing.T) {
+	entry := `{"level":"INFO","type":"API","message":"m"}`
+	many := "[" + strings.TrimSuffix(strings.Repeat(entry+",", maxBatchEntries+1), ",") + "]"
+	tests := []struct {
+		name       string
+		body       string
+		storeErr   error
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "two entries", body: `[` + entry + `,{"level":"ERROR","type":"X","service":"s","message":"n","attrs":{"a":1}}]`, wantStatus: http.StatusOK, wantBody: `{"ids":[10,11]}`},
+		{name: "empty array", body: `[]`, wantStatus: http.StatusBadRequest, wantBody: "1 to 100"},
+		{name: "too many", body: many, wantStatus: http.StatusBadRequest, wantBody: "1 to 100"},
+		{name: "not an array", body: entry, wantStatus: http.StatusBadRequest, wantBody: "invalid JSON"},
+		{name: "invalid entry is named", body: `[` + entry + `,{"level":"NOPE","type":"API","message":"m"}]`, wantStatus: http.StatusBadRequest, wantBody: "entry 1: invalid level"},
+		{name: "store error is generic", body: `[` + entry + `]`, storeErr: errors.New("pq: secret"), wantStatus: http.StatusInternalServerError, wantBody: "internal server error"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ms := &mockStore{insertID: 10, insertErr: tc.storeErr}
+			rr := httptest.NewRecorder()
+			newTestServer(ms).AddLogsBatchHandler(rr, httptest.NewRequest("POST", "/api/logs/batch", strings.NewReader(tc.body)))
+			if rr.Code != tc.wantStatus || !strings.Contains(rr.Body.String(), tc.wantBody) {
+				t.Fatalf("got %d %q, want %d containing %q", rr.Code, rr.Body.String(), tc.wantStatus, tc.wantBody)
+			}
+			if tc.wantStatus != http.StatusOK && ms.batch != nil {
+				t.Fatal("a rejected batch reached the store")
+			}
+		})
+	}
+}
+
+func TestAddLogsBatchHandlerBodyTooLarge(t *testing.T) {
+	body := `[{"level":"INFO","type":"API","message":"` + strings.Repeat("x", maxBatchBodyBytes) + `"}]`
+	rr := httptest.NewRecorder()
+	newTestServer(&mockStore{}).AddLogsBatchHandler(rr, httptest.NewRequest("POST", "/api/logs/batch", strings.NewReader(body)))
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rr.Code)
+	}
+}
+
+func TestFacetsHandler(t *testing.T) {
+	rr := httptest.NewRecorder()
+	ms := &mockStore{facets: models.Facets{Types: []string{"API"}, Services: []string{"web"}}}
+	newTestServer(ms).FacetsHandler(rr, httptest.NewRequest("GET", "/api/facets", nil))
+	if rr.Code != http.StatusOK || strings.TrimSpace(rr.Body.String()) != `{"types":["API"],"services":["web"]}` {
+		t.Fatalf("got %d %q", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	newTestServer(&mockStore{facetsErr: errors.New("pq: secret")}).FacetsHandler(rr, httptest.NewRequest("GET", "/api/facets", nil))
+	assertGeneric500(t, rr)
 }
 
 func TestStoreErrorsAreNotLeaked(t *testing.T) {
@@ -324,8 +457,8 @@ func TestAddLogHandler(t *testing.T) {
 			statusCode: http.StatusBadRequest,
 		},
 		{
-			name:       "invalid type",
-			body:       `{"level":"INFO","type":"NETWORK","message":"test"}`,
+			name:       "missing type",
+			body:       `{"level":"INFO","message":"test"}`,
 			statusCode: http.StatusBadRequest,
 		},
 		{

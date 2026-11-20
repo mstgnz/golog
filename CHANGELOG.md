@@ -4,6 +4,32 @@ All notable changes to GoLog are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.0] - Unreleased
+
+Nothing changes for existing HTTP clients, SQL writers or databases unless noted below; the server migrates the schema on start.
+
+### Added
+- `gologslog`: a `log/slog` handler that sends records in background batches and never blocks the caller (standard library only).
+- Free-form `type` (1-50 characters) and a new `service` field; a JSON `attrs` object per entry (16 KiB).
+- Optional client `timestamp` on `POST /api/logs` (at most one hour ahead); missing means the server's time.
+- Filters `service`, `q` (message text) and `attr.<key>` on `GET /api/logs`, the stream and the CLI. List and stream apply identical rules.
+- `POST /api/logs/batch` (1-100 entries, all or nothing) and `GET /api/facets`.
+- Read and write tokens (`GOLOG_READ_TOKEN`, `GOLOG_WRITE_TOKEN`), a dashboard sign-in with an HttpOnly session cookie, and a rate-limited login. Without tokens GoLog stays open and warns at startup.
+- Retention: `GOLOG_RETENTION_DAYS` deletes old logs hourly in small batches. Off by default.
+- CLI: `-service`, `-q`, `-attr key=value`, and `-url` / `GOLOG_URL` to read a remote server with the read token.
+- Dashboard: sign-in, type and service dropdowns from real data, text and attribute search, attributes under each message, favicon.
+- `DB_HOST` may be a unix socket directory.
+- Migrations 0003 (`service`, `attrs` columns, no rewrite) and 0004 (GIN index on `attrs`, built concurrently).
+
+### Changed
+- `type` is no longer limited to the five built-in values, and the CLI no longer upper-cases `-type` (types are case-sensitive now; `-level` still accepts any case).
+- The message limit counts characters, not bytes. Input PostgreSQL would refuse is a `400`, not a `500`: NUL characters, numbers in attrs beyond 100 characters or an exponent of ±1000, and invalid UTF-8 in query-string filters. Attrs are re-encoded before storage, so escapes such as a lone `\ud800` are stored as U+FFFD instead of failing.
+- `POST /api/logs` body limit raised from 64 KiB to 128 KiB to fit a maximum entry with escaped characters.
+- `docker-compose.yml` binds Postgres and GoLog to `127.0.0.1`.
+- A failed no-transaction migration names the recovery step in its error.
+- CI actions moved to their Node 24 majors.
+- For Go code that implements `handlers.LogStore` outside this repository: the interface gained `InsertLogs` and `Facets`. The server packages are not meant as a library API; `gologslog` is.
+
 ## [2.0.0] - 2026-11-20
 
 ### Breaking
